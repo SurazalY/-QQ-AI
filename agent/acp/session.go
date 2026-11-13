@@ -65,7 +65,8 @@ type acpSession struct {
 	// to the platform instead of buffering them until the next turn.
 	promptInFlight atomic.Int32
 
-	callbacks sessionCallbacks // may be nil (tests, integration harness)
+	callbacks           sessionCallbacks // may be nil (tests, integration harness)
+	autoApproveCommands []string
 }
 
 type permState struct {
@@ -82,15 +83,16 @@ type permState struct {
 // adding optional knobs (initialMode, callbacks) and would otherwise
 // break every call site each time.
 type acpSessionConfig struct {
-	command         string
-	args            []string
-	extraEnv        []string
-	workDir         string
-	resumeSessionID string
-	authMethod      string
-	initialMode     string           // if non-empty, applied via session/set_mode after session/new
-	initialModel    string           // if non-empty, applied via session/set_config_option after handshake
-	callbacks       sessionCallbacks // may be nil
+	command             string
+	args                []string
+	extraEnv            []string
+	workDir             string
+	resumeSessionID     string
+	authMethod          string
+	initialMode         string           // if non-empty, applied via session/set_mode after session/new
+	initialModel        string           // if non-empty, applied via session/set_config_option after handshake
+	callbacks           sessionCallbacks // may be nil
+	autoApproveCommands []string
 }
 
 func newACPSession(ctx context.Context, cfg acpSessionConfig) (*acpSession, error) {
@@ -101,14 +103,15 @@ func newACPSession(ctx context.Context, cfg acpSessionConfig) (*acpSession, erro
 
 	sessionCtx, cancel := context.WithCancel(ctx)
 	s := &acpSession{
-		workDir:       absWorkDir,
-		events:        make(chan core.Event, 128),
-		ctx:           sessionCtx,
-		cancel:        cancel,
-		permByID:      make(map[string]permState),
-		toolInputByID: make(map[string]string),
-		acpSessID:     cfg.resumeSessionID,
-		callbacks:     cfg.callbacks,
+		workDir:             absWorkDir,
+		events:              make(chan core.Event, 128),
+		ctx:                 sessionCtx,
+		cancel:              cancel,
+		permByID:            make(map[string]permState),
+		toolInputByID:       make(map[string]string),
+		acpSessID:           cfg.resumeSessionID,
+		callbacks:           cfg.callbacks,
+		autoApproveCommands: cfg.autoApproveCommands,
 	}
 	s.alive.Store(true)
 
@@ -755,6 +758,23 @@ func (s *acpSession) handlePermissionRequest(id json.RawMessage, params json.Raw
 	s.permMu.Lock()
 	s.permByID[reqKey] = permState{RPCID: id, Options: p.Options}
 	s.permMu.Unlock()
+	if p.ToolCall.Kind == "execute" && len(s.autoApproveCommands) > 0 {
+		var input struct {
+			CommandLine string `json:"CommandLine"`
+		}
+		if err := json.Unmarshal(p.ToolCall.RawInput, &input); err != nil {
+			_ = s.tr.respondError(id, -32602, "invalid command input")
+			return
+		}
+		for _, command := range s.autoApproveCommands {
+			if input.CommandLine == command {
+				if err := s.RespondPermission(reqKey, core.PermissionResult{Behavior: "allow"}); err != nil {
+					s.emit(core.Event{Type: core.EventError, Error: err})
+				}
+				return
+			}
+		}
+	}
 
 	rawTool := map[string]any{}
 	_ = json.Unmarshal(params, &rawTool)

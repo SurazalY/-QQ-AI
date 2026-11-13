@@ -20,15 +20,16 @@ func init() {
 
 // Agent runs an ACP (Agent Client Protocol) agent subprocess over stdio JSON-RPC.
 type Agent struct {
-	workDir      string
-	cmd          string
-	cliExtraArgs []string // extra args from cmd, prepended before args
-	args         []string
-	staticEnv    map[string]string
-	extraEnv     []string
-	sessionEnv   []string
-	authMethod   string // optional, e.g. "cursor_login" for Cursor CLI (see authenticate RPC)
-	displayName  string // optional, for doctor (default "ACP")
+	workDir             string
+	cmd                 string
+	cliExtraArgs        []string // extra args from cmd, prepended before args
+	args                []string
+	autoApproveCommands []string
+	staticEnv           map[string]string
+	extraEnv            []string
+	sessionEnv          []string
+	authMethod          string // optional, e.g. "cursor_login" for Cursor CLI (see authenticate RPC)
+	displayName         string // optional, for doctor (default "ACP")
 
 	// mode is the pending permission mode to apply to new sessions.
 	// When set, StartSession applies it via session/set_mode right after
@@ -97,6 +98,7 @@ func New(opts map[string]any) (core.Agent, error) {
 	}
 
 	args := parseStringSlice(opts["args"])
+	autoApproveCommands := parseStringSlice(opts["auto_approve_commands"])
 	staticEnv := envMapFromOpts(opts)
 	extra := envPairsFromOpts(opts)
 	authMethod, _ := opts["auth_method"].(string)
@@ -108,17 +110,21 @@ func New(opts map[string]any) (core.Agent, error) {
 	}
 	mode, _ := opts["mode"].(string)
 	mode = strings.TrimSpace(mode)
+	model, _ := opts["model"].(string)
 
 	return &Agent{
-		workDir:      workDir,
-		cmd:          cmdStr,
-		cliExtraArgs: cliExtraArgs,
-		args:         args,
-		staticEnv:    staticEnv,
-		extraEnv:     extra,
-		authMethod:   authMethod,
-		displayName:  displayName,
-		mode:         mode,
+		workDir:             workDir,
+		cmd:                 cmdStr,
+		cliExtraArgs:        cliExtraArgs,
+		args:                args,
+		autoApproveCommands: autoApproveCommands,
+		staticEnv:           staticEnv,
+		extraEnv:            extra,
+		authMethod:          authMethod,
+		displayName:         displayName,
+		mode:                mode,
+		currentModel:        model,
+		modelOverride:       model,
 	}, nil
 }
 
@@ -215,6 +221,9 @@ func (a *Agent) WorkspaceAgentOptions() map[string]any {
 	if len(a.args) > 0 {
 		opts["args"] = append([]string(nil), a.args...)
 	}
+	if len(a.autoApproveCommands) > 0 {
+		opts["auto_approve_commands"] = append([]string(nil), a.autoApproveCommands...)
+	}
 	if len(a.staticEnv) > 0 {
 		env := make(map[string]string, len(a.staticEnv))
 		for k, v := range a.staticEnv {
@@ -253,15 +262,16 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	a.modelsMu.RUnlock()
 
 	return newACPSession(ctx, acpSessionConfig{
-		command:         command,
-		args:            allArgs,
-		extraEnv:        extra,
-		workDir:         workDir,
-		resumeSessionID: sessionID,
-		authMethod:      authMethod,
-		initialMode:     pendingMode,
-		initialModel:    pendingModel,
-		callbacks:       a,
+		command:             command,
+		args:                allArgs,
+		extraEnv:            extra,
+		workDir:             workDir,
+		resumeSessionID:     sessionID,
+		authMethod:          authMethod,
+		initialMode:         pendingMode,
+		initialModel:        pendingModel,
+		callbacks:           a,
+		autoApproveCommands: a.autoApproveCommands,
 	})
 }
 

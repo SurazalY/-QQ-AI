@@ -1,6 +1,7 @@
 package qq
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,52 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+func TestSnowLumaOptions(t *testing.T) {
+	platform, err := New(map[string]any{
+		"token": "ws-token", "http_token": "http-token",
+		"allow_groups": "706636822", "allow_private": "839107207", "split_lines": true, "error_user_id": "839107207",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := platform.(*Platform)
+	if p.httpToken != "http-token" || p.token != "ws-token" || !p.splitLines || p.errorUserID != 839107207 {
+		t.Fatal("SnowLuma options were not applied")
+	}
+	// Rejected conversations must return before parsing attachments or invoking the engine.
+	p.handleMessage(map[string]any{"message_type": "group", "group_id": float64(123), "user_id": float64(839107207)})
+	p.handleMessage(map[string]any{"message_type": "private", "user_id": float64(123)})
+	for _, content := range []string{"", " \n ", "[SILENT]", " \n[SILENT]\n "} {
+		if err := p.Send(context.Background(), nil, content); err != nil {
+			t.Fatal(err)
+		}
+	}
+	platform, err = New(map[string]any{"token": "shared-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if platform.(*Platform).httpToken != "shared-token" {
+		t.Fatal("http_token must retain the documented shared-token behavior")
+	}
+}
+
+func TestParseMessage_PreservesMentionTarget(t *testing.T) {
+	p := &Platform{selfID: 3905380281}
+	for _, tc := range []struct{ target, want string }{
+		{"3905380281", "[QQ：此消息直接 @ 了你] 你好"},
+		{"839107207", "@839107207 你好"},
+	} {
+		payload := map[string]any{"message": []any{
+			map[string]any{"type": "at", "data": map[string]any{"qq": tc.target}},
+			map[string]any{"type": "text", "data": map[string]any{"text": "你好"}},
+		}}
+		text, _, _, _ := p.parseMessage(payload, "group", 706636822)
+		if text != tc.want {
+			t.Fatalf("mention %s: got %q, want %q", tc.target, text, tc.want)
+		}
+	}
+}
 
 func TestPlatform_Name(t *testing.T) {
 	p := &Platform{}

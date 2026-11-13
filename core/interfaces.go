@@ -44,6 +44,11 @@ type Platform interface {
 	Stop() error
 }
 
+// ErrorSender delivers system errors separately from conversation replies.
+type ErrorSender interface {
+	SendError(ctx context.Context, replyCtx any, content string) error
+}
+
 // ErrNotSupported indicates a platform doesn't support a particular operation.
 var ErrNotSupported = errors.New("operation not supported by this platform")
 

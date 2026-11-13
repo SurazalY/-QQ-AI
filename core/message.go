@@ -420,6 +420,7 @@ type Message struct {
 	Location     *LocationAttachment // geographical location (if any)
 	ExtraContent string              // platform-enriched content (e.g. location text, reply quote) prepended for the agent
 	OnAccepted   func()              // called once when the engine accepts this message for an agent turn
+	MergeQueued  bool                // combine busy-session messages into one pending turn
 	ChannelKey   string              // platform-provided channel identifier for workspace binding (optional)
 	// LegacyChannelKey is the platform-provided channel identifier used by an
 	// older workspace-binding scope. When both keys are set, multi-workspace

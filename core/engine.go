@@ -1956,7 +1956,7 @@ func (e *Engine) executeTimerShell(p Platform, replyCtx any, job *TimerJob) erro
 	}
 
 	if err := shellCmd.Start(); err != nil {
-		e.send(p, replyCtx, fmt.Sprintf("⏰ ❌ `%s`\nerror: failed to start: %v", cmdLabel, err))
+		e.sendError(p, replyCtx, fmt.Sprintf("⏰ ❌ `%s`\nerror: failed to start: %v", cmdLabel, err))
 		return fmt.Errorf("shell: start: %w", err)
 	}
 
@@ -2129,7 +2129,7 @@ func (e *Engine) executeCronShell(p Platform, replyCtx any, job *CronJob) error 
 	}
 
 	if err := shellCmd.Start(); err != nil {
-		e.send(p, replyCtx, fmt.Sprintf("⏰ ❌ `%s`\nerror: failed to start: %v", cmdLabel, err))
+		e.sendError(p, replyCtx, fmt.Sprintf("⏰ ❌ `%s`\nerror: failed to start: %v", cmdLabel, err))
 		return fmt.Errorf("shell: start: %w", err)
 	}
 
@@ -3082,7 +3082,7 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		wsAgent, wsSessions, err = e.getOrCreateWorkspaceAgent(forcedWorkDir)
 		if err != nil {
 			slog.Error("failed to create send work_dir agent", "work_dir", forcedWorkDir, "err", err)
-			e.reply(p, msg.ReplyCtx, fmt.Sprintf("Failed to initialize workspace: %v", err))
+			e.sendError(p, msg.ReplyCtx, fmt.Sprintf("Failed to initialize workspace: %v", err))
 			return
 		}
 		resolvedWorkspace = forcedWorkDir
@@ -3092,7 +3092,7 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		workspace, channelName, err := e.resolveWorkspace(p, channelID)
 		if err != nil {
 			slog.Error("workspace resolution failed", "err", err)
-			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+			e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 			return
 		}
 		if workspace == "" {
@@ -3122,7 +3122,7 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 			wsAgent, wsSessions, _, effectiveWorkspace, err = e.workspaceContext(workspace, msg.SessionKey)
 			if err != nil {
 				slog.Error("failed to create workspace agent", "workspace", workspace, "err", err)
-				e.reply(p, msg.ReplyCtx, fmt.Sprintf("Failed to initialize workspace: %v", err))
+				e.sendError(p, msg.ReplyCtx, fmt.Sprintf("Failed to initialize workspace: %v", err))
 				return
 			}
 			resolvedWorkspace = effectiveWorkspace
@@ -3429,12 +3429,7 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		e.logStaleUserMessageDropped("reject_before_queue", msg, interactiveKey, snap)
 		return true
 	}
-	if len(state.pendingMessages) >= e.maxQueuedMessages {
-		depth := len(state.pendingMessages)
-		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgQueueFull), depth))
-		return true // handled: queue-full reply sent
-	}
-	state.pendingMessages = append(state.pendingMessages, queuedMessage{
+	queued := queuedMessage{
 		messageID:         msg.MessageID,
 		platform:          p,
 		replyCtx:          msg.ReplyCtx,
@@ -3448,7 +3443,29 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		msgSessionKey:     msg.SessionKey,
 		channelKey:        msg.ChannelKey,
 		userMessageTimeMs: msg.UserMessageTimeMs,
-	})
+	}
+	if msg.MergeQueued {
+		queued.content = e.buildSenderPrompt(msg.Content, msg.UserID, msg.UserName, msg.Platform, msg.SessionKey, msg.ChannelKey)
+		queued.userID = "" // Each message already carries its own sender header.
+	}
+	if msg.MergeQueued && len(state.pendingMessages) > 0 {
+		last := len(state.pendingMessages) - 1
+		previous := state.pendingMessages[last]
+		queued.content = previous.content + "\n\n" + queued.content
+		queued.images = append(previous.images, queued.images...)
+		queued.files = append(previous.files, queued.files...)
+		state.pendingMessages[last] = queued
+	} else {
+		if len(state.pendingMessages) >= e.maxQueuedMessages {
+			depth := len(state.pendingMessages)
+			slog.Warn("message queue full", "session", msg.SessionKey, "queue_depth", depth)
+			if e.display.Mode != "quiet" {
+				e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgQueueFull), depth))
+			}
+			return true
+		}
+		state.pendingMessages = append(state.pendingMessages, queued)
+	}
 	// A queued message is still the user talking: restart the
 	// reset_on_idle_mins clock now, as the idle path does, or the next
 	// message is measured from the last one that found the session idle
@@ -3476,7 +3493,9 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		"user", msg.UserName,
 		"queue_depth", queueDepth,
 	)
-	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMessageQueued))
+	if e.display.Mode != "quiet" {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMessageQueued))
+	}
 	return true
 }
 
@@ -3560,7 +3579,7 @@ func (e *Engine) handleVoiceMessage(p Platform, msg *Message) {
 	text, err := TranscribeAudio(e.ctx, e.speech.STT, audio, e.speech.Language)
 	if err != nil {
 		slog.Error("speech transcription failed", "error", err)
-		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgVoiceTranscribeFailed), err))
+		e.sendError(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgVoiceTranscribeFailed), err))
 		return
 	}
 
@@ -3686,7 +3705,7 @@ found:
 			UpdatedInput: updatedInput,
 		}); err != nil {
 			slog.Error("failed to send AskUserQuestion response", "error", err)
-			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
+			e.sendError(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
 		} else {
 			e.reply(p, msg.ReplyCtx, fmt.Sprintf("✅ %s: **%s**", q.Question, answer))
 		}
@@ -3700,6 +3719,13 @@ found:
 
 	lower := strings.ToLower(strings.TrimSpace(content))
 
+	e.userRolesMu.RLock()
+	adminRestricted := e.adminFrom != ""
+	e.userRolesMu.RUnlock()
+	if adminRestricted && !e.isAdmin(msg.UserID) {
+		return true
+	}
+
 	if isApproveAllResponse(lower) {
 		state.mu.Lock()
 		state.approveAll = true
@@ -3710,7 +3736,7 @@ found:
 			UpdatedInput: pending.ToolInput,
 		}); err != nil {
 			slog.Error("failed to send permission response", "error", err)
-			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
+			e.sendError(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
 		} else {
 			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPermissionApproveAll))
 		}
@@ -3720,7 +3746,7 @@ found:
 			UpdatedInput: pending.ToolInput,
 		}); err != nil {
 			slog.Error("failed to send permission response", "error", err)
-			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
+			e.sendError(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
 		} else if _, hasButtons := p.(InlineButtonSender); !hasButtons {
 			// Platforms with native inline buttons already acknowledge the click
 			// client-side (visited state); an extra text confirmation is noise.
@@ -4067,7 +4093,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	defer stopRecallMonitor()
 
 	if state.agentSession == nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgFailedToStartAgentSession))
+		e.sendError(p, msg.ReplyCtx, e.i18n.T(MsgFailedToStartAgentSession))
 		return
 	}
 	e.cancelAgentSessionIdleClose(state)
@@ -4459,7 +4485,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 		session.SetAgentSessionID("", agent.Name())
 		sessions.Save()
 		startSessionID = ""
-		e.send(p, replyCtx, e.i18n.T(MsgSessionResumeUnsafe))
+		e.sendError(p, replyCtx, e.i18n.T(MsgSessionResumeUnsafe))
 	}
 
 	isResume := startSessionID != ""
@@ -5348,7 +5374,7 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 				}
 				if event.Error != nil {
 					slog.Error("unsolicited agent error", "error", event.Error, "session", sessionKey)
-					e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), event.Error))
+					e.sendError(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), event.Error))
 				}
 				state.mu.Lock()
 				alive := agentSession.Alive() && !state.stopped
@@ -5537,7 +5563,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				state.mu.Lock()
 				p := state.platform
 				state.mu.Unlock()
-				e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
+				e.sendError(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
 				return
 			}
 			continue
@@ -5550,7 +5576,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			state.eventsNeedResync = true
 			p := state.platform
 			state.mu.Unlock()
-			e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "agent session timed out (no response)"))
+			e.sendError(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "agent session timed out (no response)"))
 			e.cleanupInteractiveState(sessionKey, state)
 			return
 		case <-turnDeadlineCh:
@@ -5562,7 +5588,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			state.mu.Lock()
 			p := state.platform
 			state.mu.Unlock()
-			e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError),
+			e.sendError(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError),
 				fmt.Sprintf("agent turn exceeded maximum time (%v), stopping", e.maxTurnTime)))
 
 			// Two-phase shutdown: first try a graceful stop so the agent can
@@ -6832,7 +6858,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						break
 					}
 				}
-				e.send(p, replyCtx, userMsg)
+				e.sendError(p, replyCtx, userMsg)
 			}
 			// Only drop queued messages if the agent session is dead.
 			// Some agents (e.g. Codex) emit EventError for per-turn failures
@@ -6966,7 +6992,7 @@ func (e *Engine) notifyDroppedQueuedMessages(state *interactiveState, reason err
 	state.pendingMessages = nil
 	state.mu.Unlock()
 	for _, q := range remaining {
-		e.send(q.platform, q.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), reason))
+		e.sendError(q.platform, q.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), reason))
 	}
 }
 
@@ -7014,7 +7040,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		as := state.agentSession // capture under lock to avoid race with cleanup (mirrors #1436)
 		state.mu.Unlock()
 		if as == nil || !as.Alive() {
-			e.send(queued.platform, queued.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "agent session ended"))
+			e.sendError(queued.platform, queued.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "agent session ended"))
 			e.notifyDroppedQueuedMessages(state, fmt.Errorf("agent session ended"))
 			return false
 		}
@@ -7122,7 +7148,7 @@ func (e *Engine) cmdPs(p Platform, msg *Message, args []string) {
 	}
 	if err := state.agentSession.Send(text, "", nil, nil); err != nil {
 		slog.Error("ps: send failed", "error", err)
-		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPsSendFailed))
+		e.sendError(p, msg.ReplyCtx, e.i18n.T(MsgPsSendFailed))
 		return
 	}
 	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPsSent))
@@ -7361,7 +7387,7 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 		}
 		registry, err := e.skillsForMessage(p, msg)
 		if err != nil {
-			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+			e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 			return true
 		}
 		if skill := registry.Resolve(cmd); skill != nil {
@@ -7426,7 +7452,7 @@ func (e *Engine) handleWorkspaceCommand(p Platform, msg *Message, args []string)
 			if os.IsNotExist(err) {
 				e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsRouteNotFound, routePath))
 			} else {
-				e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+				e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 			}
 			return false
 		}
@@ -7492,7 +7518,7 @@ func (e *Engine) handleWorkspaceCommand(p Platform, msg *Message, args []string)
 		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsCloneProgress, target))
 
 		if err := gitClone(target, cloneTo); err != nil {
-			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsCloneFailed, err))
+			e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsCloneFailed, err))
 			return false
 		}
 
@@ -7627,7 +7653,7 @@ func (e *Engine) handleWorkspaceCommand(p Platform, msg *Message, args []string)
 func (e *Engine) cmdNew(p Platform, msg *Message, args []string) {
 	_, sessions, interactiveKey, err := e.commandContext(p, msg)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
 	}
 
@@ -7717,14 +7743,14 @@ const dirCardPageSize = 20
 func (e *Engine) cmdList(p Platform, msg *Message, args []string) {
 	agent, sessions, _, err := e.commandContext(p, msg)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
 	}
 
 	if !supportsCards(p) {
 		agentSessions, err := agent.ListSessions(e.ctx)
 		if err != nil {
-			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgListError), err))
+			e.sendError(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgListError), err))
 			return
 		}
 		agentSessions = e.applySessionFilter(agentSessions, sessions, msg.SessionKey)
@@ -7800,7 +7826,7 @@ func (e *Engine) cmdList(p Platform, msg *Message, args []string) {
 	}
 	card, err := e.renderListCard(msg.SessionKey, page)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, err.Error())
+		e.sendError(p, msg.ReplyCtx, err.Error())
 		return
 	}
 	e.replyWithCard(p, msg.ReplyCtx, card)
@@ -7816,12 +7842,12 @@ func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
 	slog.Info("cmdSwitch: listing agent sessions", "session_key", msg.SessionKey)
 	agent, sessions, interactiveKey, err := e.commandContext(p, msg)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
 	}
 	agentSessions, err := agent.ListSessions(e.ctx)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
 		return
 	}
 	agentSessions = e.applySessionFilter(agentSessions, sessions, msg.SessionKey)
@@ -8529,13 +8555,13 @@ func (e *Engine) cmdShow(p Platform, msg *Message, args []string) {
 
 	agent, _, _, err := e.commandContext(p, msg)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
 	}
 	workDir := e.commandWorkDir(agent, msg)
 	req, err := buildReferenceViewRequest(rawRef, workDir)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgShowParseError, rawRef))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgShowParseError, rawRef))
 		return
 	}
 	content, err := renderReferenceView(req)
@@ -8546,7 +8572,7 @@ func (e *Engine) cmdShow(p Platform, msg *Message, args []string) {
 		case strings.Contains(err.Error(), "directory reference cannot carry a location"):
 			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgShowDirWithLocation, rawRef))
 		default:
-			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgShowReadFailed, err))
+			e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgShowReadFailed, err))
 		}
 		return
 	}
@@ -8609,7 +8635,7 @@ func (e *Engine) runShellWithProgress(p Platform, replyCtx any, command string, 
 
 	if err := cmd.Start(); err != nil {
 		errMsg := fmt.Sprintf("failed to start command: %v", err)
-		e.reply(p, replyCtx, fmt.Sprintf("❌ `%s`\n```\n%s\n```", cmdLabel, errMsg))
+		e.sendError(p, replyCtx, fmt.Sprintf("❌ `%s`\n```\n%s\n```", cmdLabel, errMsg))
 		return err
 	}
 
@@ -8654,7 +8680,7 @@ func (e *Engine) runShellWithProgress(p Platform, replyCtx any, command string, 
 		mu.Lock()
 		output := buf.String()
 		mu.Unlock()
-		e.send(p, replyCtx, e.formatShellTimeout(cmdLabel, output, maxOutput))
+		e.sendError(p, replyCtx, e.formatShellTimeout(cmdLabel, output, maxOutput))
 		return fmt.Errorf("command timed out after %s", timeout)
 	case <-time.After(quickFinishTimeout):
 		// Still running — fall through to progress mode
@@ -8720,7 +8746,7 @@ func (e *Engine) runShellWithProgress(p Platform, replyCtx any, command string, 
 		if useUpdate {
 			_ = updaterFor(p).UpdateMessage(e.ctx, previewHandle, timeoutMsg)
 		} else {
-			e.send(p, replyCtx, timeoutMsg)
+			e.sendError(p, replyCtx, timeoutMsg)
 		}
 		return fmt.Errorf("command timed out after %s", timeout)
 	}
@@ -8851,7 +8877,7 @@ func (e *Engine) cmdShell(p Platform, msg *Message, raw string) {
 
 	agent, _, _, err := e.commandContext(p, msg)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
 	}
 	workDir := e.commandWorkDir(agent, msg)
@@ -8870,7 +8896,7 @@ func (e *Engine) cmdDiff(p Platform, msg *Message, raw string) {
 	}
 
 	if strings.HasPrefix(diffTarget, "-") {
-		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), "diff target must not start with '-'"))
+		e.sendError(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), "diff target must not start with '-'"))
 		return
 	}
 
@@ -8921,11 +8947,11 @@ func (e *Engine) cmdDiff(p Platform, msg *Message, raw string) {
 		diffOutput, err := gitCmd.Output()
 
 		if ctx.Err() == context.DeadlineExceeded {
-			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCommandTimeout), "git diff"))
+			e.sendError(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCommandTimeout), "git diff"))
 			return
 		}
 		if err != nil && len(diffOutput) == 0 {
-			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+			e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
 			return
 		}
 
@@ -9098,7 +9124,7 @@ func (e *Engine) dirApply(agent Agent, sessions *SessionManager, interactiveKey,
 func (e *Engine) cmdDir(p Platform, msg *Message, args []string) {
 	agent, sessions, interactiveKey, err := e.commandContext(p, msg)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
 	}
 	switcher, ok := agent.(WorkDirSwitcher)
@@ -9147,7 +9173,7 @@ func (e *Engine) cmdDir(p Platform, msg *Message, args []string) {
 
 	errMsg, successMsg := e.dirApply(agent, sessions, interactiveKey, msg.SessionKey, args)
 	if errMsg != "" {
-		e.reply(p, msg.ReplyCtx, errMsg)
+		e.sendError(p, msg.ReplyCtx, errMsg)
 		return
 	}
 	if supportsCards(p) {
@@ -9170,12 +9196,12 @@ func (e *Engine) cmdSearch(p Platform, msg *Message, args []string) {
 	// Get all agent sessions
 	agent, sessions, _, err := e.commandContext(p, msg)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
 	}
 	agentSessions, err := agent.ListSessions(e.ctx)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgSearchError), err))
+		e.sendError(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgSearchError), err))
 		return
 	}
 	agentSessions = e.applySessionFilter(agentSessions, sessions, msg.SessionKey)
@@ -9253,7 +9279,7 @@ func (e *Engine) cmdName(p Platform, msg *Message, args []string) {
 
 	agent, sessions, _, err := e.commandContext(p, msg)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
 	}
 
@@ -9269,7 +9295,7 @@ func (e *Engine) cmdName(p Platform, msg *Message, args []string) {
 		}
 		agentSessions, err := agent.ListSessions(e.ctx)
 		if err != nil {
-			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+			e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
 			return
 		}
 		agentSessions = e.applySessionFilter(agentSessions, sessions, msg.SessionKey)
@@ -9309,7 +9335,7 @@ func (e *Engine) cmdCurrent(p Platform, msg *Message) {
 	if !supportsCards(p) {
 		agent, sessions, _, err := e.commandContext(p, msg)
 		if err != nil {
-			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+			e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 			return
 		}
 		s := sessions.GetOrCreateActive(msg.SessionKey)
@@ -9329,7 +9355,7 @@ func (e *Engine) cmdStatus(p Platform, msg *Message) {
 	if !supportsCards(p) {
 		agent, sessions, _, err := e.commandContext(p, msg)
 		if err != nil {
-			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+			e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 			return
 		}
 		platNames := make([]string, len(e.platforms))
@@ -9421,7 +9447,7 @@ func (e *Engine) cmdStatus(p Platform, msg *Message) {
 func (e *Engine) cmdUsage(p Platform, msg *Message) {
 	agent, _, _, err := e.commandContext(p, msg)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
 	}
 
@@ -9436,7 +9462,7 @@ func (e *Engine) cmdUsage(p Platform, msg *Message) {
 
 	report, err := reporter.GetUsage(fetchCtx)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgUsageFetchFailed, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgUsageFetchFailed, err))
 		return
 	}
 
@@ -9924,7 +9950,7 @@ func (e *Engine) cmdHistory(p Platform, msg *Message, args []string) {
 
 	agent, sessions, _, err := e.commandContext(p, msg)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
 	}
 	s := sessions.GetOrCreateActive(msg.SessionKey)
@@ -9940,7 +9966,7 @@ func (e *Engine) cmdHistory(p Platform, msg *Message, args []string) {
 			agentEntries, err := hp.GetSessionHistory(e.ctx, agentSID, n)
 			if err != nil {
 				slog.Warn("history: agent transcript read failed", "session_id", agentSID, "error", err)
-				e.reply(p, msg.ReplyCtx, e.i18n.T(MsgHistoryReadFailed))
+				e.sendError(p, msg.ReplyCtx, e.i18n.T(MsgHistoryReadFailed))
 				return
 			}
 			entries = agentEntries
@@ -10384,7 +10410,7 @@ func sanitizeTelegramMenuCommand(cmd string) string {
 func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 	agent, sessions, interactiveKey, err := e.commandContext(p, msg)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
 	}
 
@@ -10470,7 +10496,7 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 
 	target, err = e.switchModelOnAgent(agent, target, agent == e.agent)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgModelChangeFailed, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgModelChangeFailed, err))
 		return
 	}
 	e.persistWorkspaceModelOverride(interactiveKey, msg.SessionKey, agent, target)
@@ -10599,7 +10625,7 @@ func (e *Engine) switchModelOnAgent(agent Agent, target string, persistConfig bo
 func (e *Engine) cmdReasoning(p Platform, msg *Message, args []string) {
 	agent, sessions, _, err := e.commandContext(p, msg)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
 	}
 
@@ -10695,7 +10721,7 @@ func (e *Engine) reasoningUsage(efforts []string) string {
 func (e *Engine) cmdMode(p Platform, msg *Message, args []string) {
 	agent, _, _, err := e.commandContext(p, msg)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
 	}
 
@@ -10913,7 +10939,7 @@ func (e *Engine) cmdStop(p Platform, msg *Message) {
 func (e *Engine) cmdCancel(p Platform, msg *Message) {
 	_, sessions, interactiveKey, err := e.commandContext(p, msg)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
 	}
 
@@ -11052,7 +11078,7 @@ normalCleanup:
 func (e *Engine) cmdCompress(p Platform, msg *Message) {
 	agent, sessions, _, err := e.commandContext(p, msg)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
 	}
 
@@ -11127,7 +11153,7 @@ func (e *Engine) runCompress(state *interactiveState, session *Session, sessions
 	cmd := compressor.CompressCommand()
 	if err := state.agentSession.Send(cmd, "", nil, nil); err != nil {
 		if !auto {
-			e.reply(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
+			e.sendError(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
 		}
 		if !state.agentSession.Alive() {
 			e.cleanupInteractiveState(iKey)
@@ -11191,7 +11217,7 @@ func (e *Engine) processCompressEvents(state *interactiveState, session *Session
 		case <-idleCh:
 			logCompletion("idle_timeout")
 			if !auto {
-				e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "compress timed out"))
+				e.sendError(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "compress timed out"))
 			}
 			e.cleanupInteractiveState(sessionKey, state)
 			e.notifyDroppedQueuedMessages(state, fmt.Errorf("compress timed out"))
@@ -11257,7 +11283,7 @@ func (e *Engine) processCompressEvents(state *interactiveState, session *Session
 		case EventError:
 			logCompletion("error")
 			if !auto && event.Error != nil {
-				e.reply(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), event.Error))
+				e.sendError(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), event.Error))
 			}
 			// Only drop queued messages if the agent is dead; some agents
 			// emit per-turn EventError while staying alive.
@@ -11289,7 +11315,7 @@ func (e *Engine) drainQueuedMessagesAfterCompress(state *interactiveState, sessi
 func (e *Engine) cmdAllow(p Platform, msg *Message, args []string) {
 	agent, _, _, err := e.commandContext(p, msg)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
 	}
 
@@ -11310,7 +11336,7 @@ func (e *Engine) cmdAllow(p Platform, msg *Message, args []string) {
 	toolName := strings.TrimSpace(args[0])
 	if auth, ok := agent.(ToolAuthorizer); ok {
 		if err := auth.AddAllowedTools(toolName); err != nil {
-			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgToolAllowFailed), err))
+			e.sendError(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgToolAllowFailed), err))
 			return
 		}
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgToolAllowedNew), toolName))
@@ -11322,7 +11348,7 @@ func (e *Engine) cmdAllow(p Platform, msg *Message, args []string) {
 func (e *Engine) cmdProvider(p Platform, msg *Message, args []string) {
 	agent, sessions, _, err := e.commandContext(p, msg)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
 	}
 
@@ -11485,11 +11511,11 @@ func (e *Engine) cmdProviderAdd(p Platform, msg *Message, switcher ProviderSwitc
 			Env     map[string]string `json:"env"`
 		}
 		if err := json.Unmarshal([]byte(raw), &jp); err != nil {
-			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgProviderAddFailed), "invalid JSON: "+err.Error()))
+			e.sendError(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgProviderAddFailed), "invalid JSON: "+err.Error()))
 			return
 		}
 		if jp.Name == "" {
-			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgProviderAddFailed), "\"name\" is required"))
+			e.sendError(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgProviderAddFailed), "\"name\" is required"))
 			return
 		}
 		prov = ProviderConfig{Name: jp.Name, APIKey: jp.APIKey, BaseURL: jp.BaseURL, Model: jp.Model, Env: jp.Env}
@@ -11512,7 +11538,7 @@ func (e *Engine) cmdProviderAdd(p Platform, msg *Message, switcher ProviderSwitc
 	// Check for duplicates
 	for _, existing := range switcher.ListProviders() {
 		if existing.Name == prov.Name {
-			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgProviderAddFailed), fmt.Sprintf("provider %q already exists", prov.Name)))
+			e.sendError(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgProviderAddFailed), fmt.Sprintf("provider %q already exists", prov.Name)))
 			return
 		}
 	}
@@ -11679,7 +11705,7 @@ func (e *Engine) handlePendingProviderAdd(p Platform, msg *Message, content stri
 
 	for _, existing := range switcher.ListProviders() {
 		if existing.Name == prov.Name {
-			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgProviderAddFailed), fmt.Sprintf("provider %q already exists", prov.Name)))
+			e.sendError(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgProviderAddFailed), fmt.Sprintf("provider %q already exists", prov.Name)))
 			return true
 		}
 	}
@@ -12676,6 +12702,21 @@ func (e *Engine) sendAlreadyRenderedWithError(p Platform, replyCtx any, content 
 		slog.Warn("slow platform send", "platform", p.Name(), "elapsed", elapsed, "content_len", len(content))
 	}
 	return nil
+}
+
+// sendError keeps system failures separate from normal agent replies.
+func (e *Engine) sendError(p Platform, replyCtx any, content string) {
+	if sender, ok := p.(ErrorSender); ok {
+		if err := e.waitOutgoing(p); err != nil {
+			slog.Warn("error notification cancelled", "error", err)
+			return
+		}
+		if err := sender.SendError(e.ctx, replyCtx, content); err != nil {
+			slog.Error("error notification failed", "platform", p.Name(), "error", err)
+		}
+		return
+	}
+	e.send(p, replyCtx, content)
 }
 
 // send wraps p.Send with error logging, slow-operation warnings, and outgoing rate limiting.
@@ -14668,7 +14709,7 @@ func (e *Engine) renderUpgradeCard() *Card {
 func (e *Engine) cmdMemory(p Platform, msg *Message, args []string) {
 	agent, _, _, err := e.commandContext(p, msg)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
 	}
 
@@ -14754,20 +14795,20 @@ func (e *Engine) appendMemoryFile(p Platform, msg *Message, filePath, text strin
 
 	dir := filepath.Dir(filePath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgMemoryAddFailed), err))
+		e.sendError(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgMemoryAddFailed), err))
 		return
 	}
 
 	f, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgMemoryAddFailed), err))
+		e.sendError(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgMemoryAddFailed), err))
 		return
 	}
 	defer f.Close()
 
 	entry := "\n- " + text + "\n"
 	if _, err := f.WriteString(entry); err != nil {
-		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgMemoryAddFailed), err))
+		e.sendError(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgMemoryAddFailed), err))
 		return
 	}
 
@@ -14843,7 +14884,7 @@ func (e *Engine) cmdCronAdd(p Platform, msg *Message, args []string) {
 	}
 
 	if err := e.cronScheduler.AddJob(job); err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
 		return
 	}
 
@@ -14876,7 +14917,7 @@ func (e *Engine) cmdCronAddExec(p Platform, msg *Message, args []string) {
 	}
 
 	if err := e.cronScheduler.AddJob(job); err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
 		return
 	}
 
@@ -14968,7 +15009,7 @@ func (e *Engine) cmdCronExec(p Platform, msg *Message, args []string) {
 		case errors.Is(err, ErrCronProjectNotFound):
 			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCronProjectUnavailable))
 		default:
-			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+			e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
 		}
 		return
 	}
@@ -15001,7 +15042,7 @@ func (e *Engine) cmdCronToggle(p Platform, msg *Message, args []string, enable b
 		err = e.cronScheduler.DisableJob(id)
 	}
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
 		return
 	}
 	if enable {
@@ -15038,7 +15079,7 @@ func (e *Engine) cmdCronSetup(p Platform, msg *Message) {
 	case setupExists:
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgRelaySetupExists), baseName))
 	case setupError:
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
 	case setupOK:
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCronSetupOK), baseName))
 	}
@@ -15093,7 +15134,7 @@ func (e *Engine) cmdTimerAdd(p Platform, msg *Message, args []string) {
 
 	fireAt, err := ParseDelayOrTime(args[0])
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
 		return
 	}
 
@@ -15109,7 +15150,7 @@ func (e *Engine) cmdTimerAdd(p Platform, msg *Message, args []string) {
 	}
 
 	if err := e.timerScheduler.AddJob(job); err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
 		return
 	}
 
@@ -15131,7 +15172,7 @@ func (e *Engine) cmdTimerAddExec(p Platform, msg *Message, args []string) {
 
 	fireAt, err := ParseDelayOrTime(args[0])
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
 		return
 	}
 
@@ -15147,7 +15188,7 @@ func (e *Engine) cmdTimerAddExec(p Platform, msg *Message, args []string) {
 	}
 
 	if err := e.timerScheduler.AddJob(job); err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
 		return
 	}
 
@@ -15450,7 +15491,7 @@ func (e *Engine) executeCustomCommand(p Platform, msg *Message, cmd *CustomComma
 	// /workspace bind.
 	agent, sessions, interactiveKey, workspaceDir, err := e.commandContextWithWorkspace(p, msg)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
 	}
 
@@ -15670,7 +15711,7 @@ func (e *Engine) executeSkill(p Platform, msg *Message, skill *Skill, args []str
 	prompt := BuildSkillInvocationPrompt(skill, args)
 	_, _, _, err := e.commandContext(p, msg)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
 	}
 
@@ -15679,7 +15720,7 @@ func (e *Engine) executeSkill(p Platform, msg *Message, skill *Skill, args []str
 	// work_dir), bypassing any per-channel binding written by /workspace bind.
 	agent, sessions, interactiveKey, workspaceDir, err := e.commandContextWithWorkspace(p, msg)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
 	}
 
@@ -15704,7 +15745,7 @@ func (e *Engine) executeSkill(p Platform, msg *Message, skill *Skill, args []str
 func (e *Engine) cmdSkills(p Platform, msg *Message) {
 	registry, err := e.skillsForMessage(p, msg)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
 	}
 	if !supportsCards(p) {
@@ -15954,7 +15995,7 @@ func (e *Engine) cmdConfig(p Platform, msg *Message, args []string) {
 		for _, item := range items {
 			if item.key == key {
 				if err := item.setFunc(value); err != nil {
-					e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+					e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
 					return
 				}
 				e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgConfigUpdated, key, item.getFunc()))
@@ -15969,7 +16010,7 @@ func (e *Engine) cmdConfig(p Platform, msg *Message, args []string) {
 			if item.key == key {
 				if len(args) >= 2 {
 					if err := item.setFunc(args[1]); err != nil {
-						e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+						e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
 						return
 					}
 					e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgConfigUpdated, key, item.getFunc()))
@@ -16081,7 +16122,7 @@ func (e *Engine) cmdUpgrade(p Platform, msg *Message, args []string) {
 	useGitee := e.i18n.IsZhLike()
 	release, err := CheckForUpdate(cur, useGitee)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
 		return
 	}
 	if release == nil {
@@ -16107,7 +16148,7 @@ func (e *Engine) cmdUpgradeConfirm(p Platform, msg *Message) {
 	useGitee := e.i18n.IsZhLike()
 	release, err := CheckForUpdate(cur, useGitee)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
 		return
 	}
 	if release == nil {
@@ -16118,7 +16159,7 @@ func (e *Engine) cmdUpgradeConfirm(p Platform, msg *Message) {
 	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgUpgradeDownloading), release.TagName))
 
 	if err := SelfUpdate(release.TagName, useGitee); err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
 		return
 	}
 
@@ -16141,7 +16182,7 @@ func (e *Engine) cmdConfigReload(p Platform, msg *Message) {
 	}
 	result, err := e.configReloadFunc()
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
 		return
 	}
 	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgConfigReloaded),
@@ -16262,7 +16303,7 @@ func (e *Engine) cmdAliasDel(p Platform, msg *Message, args []string) {
 func (e *Engine) cmdDelete(p Platform, msg *Message, args []string) {
 	agent, sessions, _, err := e.commandContext(p, msg)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
 	}
 	deleter, ok := agent.(SessionDeleter)
@@ -16287,7 +16328,7 @@ func (e *Engine) cmdDelete(p Platform, msg *Message, args []string) {
 
 	agentSessions, err := agent.ListSessions(e.ctx)
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
 		return
 	}
 	agentSessions = e.applySessionFilter(agentSessions, sessions, msg.SessionKey)
@@ -17058,7 +17099,7 @@ func (e *Engine) cmdBindSetup(p Platform, msg *Message) {
 	case setupExists:
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgRelaySetupExists), baseName))
 	case setupError:
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
 	case setupOK:
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgRelaySetupOK), baseName))
 	}
@@ -17917,7 +17958,7 @@ func (e *Engine) cmdWebSetup(p Platform, msg *Message) {
 
 	port, token, needRestart, err := e.webSetupFunc()
 	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+		e.sendError(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
 		return
 	}
 	url := fmt.Sprintf("http://localhost:%d", port)

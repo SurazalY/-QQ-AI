@@ -29,8 +29,13 @@ func init() {
 type Platform struct {
 	wsURL                 string // e.g. "ws://127.0.0.1:3001"
 	token                 string // optional access_token
+	httpToken             string
 	allowFrom             string // comma-separated user IDs or "*"
-	requireMention        bool   // group chats: only react when the bot is @-mentioned (default true)
+	allowGroups           string
+	errorUserID           int64
+	allowPrivate          string
+	splitLines            bool
+	requireMention        bool // group chats: only react when the bot is @-mentioned (default true)
 	shareSessionInChannel bool
 	handler               core.MessageHandler
 	conn                  *websocket.Conn
@@ -50,7 +55,23 @@ func New(opts map[string]any) (core.Platform, error) {
 		wsURL = "ws://127.0.0.1:3001"
 	}
 	token, _ := opts["token"].(string)
+	httpToken, _ := opts["http_token"].(string)
+	if httpToken == "" {
+		httpToken = token
+	}
 	allowFrom, _ := opts["allow_from"].(string)
+	allowGroups, _ := opts["allow_groups"].(string)
+	allowPrivate, _ := opts["allow_private"].(string)
+	errorUser, _ := opts["error_user_id"].(string)
+	var errorUserID int64
+	if errorUser != "" {
+		var err error
+		errorUserID, err = strconv.ParseInt(errorUser, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("qq: error_user_id: %w", err)
+		}
+	}
+	splitLines, _ := opts["split_lines"].(bool)
 	shareSessionInChannel, _ := opts["share_session_in_channel"].(bool)
 
 	// require_mention: in group chats only react when the bot is @-mentioned.
@@ -69,7 +90,12 @@ func New(opts map[string]any) (core.Platform, error) {
 	return &Platform{
 		wsURL:                 wsURL,
 		token:                 token,
+		httpToken:             httpToken,
 		allowFrom:             allowFrom,
+		allowGroups:           allowGroups,
+		allowPrivate:          allowPrivate,
+		errorUserID:           errorUserID,
+		splitLines:            splitLines,
 		requireMention:        requireMention,
 		shareSessionInChannel: shareSessionInChannel,
 		httpURL:               httpURL,
@@ -153,7 +179,8 @@ func (p *Platform) readLoop(ctx context.Context) {
 		// Otherwise it's an event
 		postType, _ := payload["post_type"].(string)
 		if postType == "message" {
-			p.handleMessage(payload)
+			// Message handling can call OneBot APIs. Keep reading their replies.
+			go p.handleMessage(payload)
 		}
 	}
 }
@@ -184,6 +211,12 @@ func (p *Platform) handleMessage(payload map[string]any) {
 	userID := jsonInt64(payload, "user_id")
 	groupID := jsonInt64(payload, "group_id")
 	messageID := jsonInt64(payload, "message_id")
+	if msgType == "group" && !core.AllowList(p.allowGroups, strconv.FormatInt(groupID, 10)) {
+		return
+	}
+	if msgType == "private" && !core.AllowList(p.allowPrivate, strconv.FormatInt(userID, 10)) {
+		return
+	}
 
 	if userID == p.selfID {
 		return
@@ -253,17 +286,18 @@ func (p *Platform) handleMessage(payload map[string]any) {
 	}
 
 	msg := &core.Message{
-		SessionKey: sessionKey,
-		Platform:   "qq",
-		MessageID:  strconv.FormatInt(messageID, 10),
-		UserID:     strconv.FormatInt(userID, 10),
-		UserName:   userName,
-		ChatName:   chatName,
-		Content:    text,
-		Images:     images,
-		Files:      files,
-		Audio:      audio,
-		ReplyCtx:   rctx,
+		SessionKey:  sessionKey,
+		Platform:    "qq",
+		MessageID:   strconv.FormatInt(messageID, 10),
+		UserID:      strconv.FormatInt(userID, 10),
+		UserName:    userName,
+		ChatName:    chatName,
+		Content:     text,
+		Images:      images,
+		Files:       files,
+		Audio:       audio,
+		ReplyCtx:    rctx,
+		MergeQueued: msgType == "group" && p.shareSessionInChannel,
 	}
 
 	slog.Debug("qq: message received", "type", msgType, "user", userID, "text_len", len(text))
@@ -294,6 +328,13 @@ func (p *Platform) parseMessage(payload map[string]any, msgType string, groupID 
 			case "text":
 				if text, ok := data["text"].(string); ok {
 					textParts = append(textParts, text)
+				}
+			case "at":
+				target := data["qq"].(string)
+				if target == strconv.FormatInt(p.selfID, 10) {
+					textParts = append(textParts, "[QQ：此消息直接 @ 了你] ")
+				} else {
+					textParts = append(textParts, "@"+target+" ")
 				}
 			case "image":
 				if url, ok := data["url"].(string); ok && url != "" {
@@ -438,8 +479,6 @@ func (p *Platform) parseMessage(payload map[string]any, msgType string, groupID 
 				if !downloaded {
 					slog.Warn("qq: file segment could not be downloaded", "name", name)
 				}
-			case "at":
-				// Ignore @mentions in parsed text
 			}
 		}
 	default:
@@ -459,25 +498,77 @@ func (p *Platform) Reply(ctx context.Context, replyCtx any, content string) erro
 
 // Send sends a message to the conversation identified by replyCtx.
 func (p *Platform) Send(ctx context.Context, replyCtx any, content string) error {
+	content = strings.TrimSpace(content)
+	if content == "" || content == "[SILENT]" {
+		return nil
+	}
 	rctx, ok := replyCtx.(*replyContext)
 	if !ok {
 		return fmt.Errorf("qq: invalid reply context")
 	}
 
-	params := map[string]any{
-		"message": content,
+	// agy also emits service warnings as ordinary ACP text, outside EventError.
+	if rctx.messageType == "group" && p.errorUserID != 0 {
+		for _, line := range strings.Split(content, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "⚠") || strings.HasPrefix(line, "❌") || strings.HasPrefix(line, "⏰ ⚠") || strings.HasPrefix(line, "⏰ ❌") {
+				return p.SendError(ctx, replyCtx, content)
+			}
+		}
 	}
-
+	parts := []string{content}
+	if p.splitLines {
+		parts = nil
+		for _, line := range strings.Split(content, "\n") {
+			line = strings.TrimSpace(line)
+			if line != "" && line != "[SILENT]" {
+				parts = append(parts, line)
+			}
+		}
+		if len(parts) > 3 {
+			parts = parts[:3]
+		}
+	}
+	action := "send_private_msg"
+	params := map[string]any{"user_id": rctx.userID}
 	if rctx.messageType == "group" {
-		params["group_id"] = rctx.groupID
-		_, err := p.callAPI("send_group_msg", params)
-		return err
+		action = "send_group_msg"
+		params = map[string]any{"group_id": rctx.groupID}
 	}
+	for i, part := range parts {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(800 * time.Millisecond):
+			}
+		}
+		params["message"] = part
+		if _, err := p.callAPI(action, params); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
-	params["user_id"] = rctx.userID
-	_, err := p.callAPI("send_private_msg", params)
+// SendError sends group failures to the configured owner, without splitting
+// or truncating diagnostic details. Private conversation errors stay private.
+func (p *Platform) SendError(ctx context.Context, replyCtx any, content string) error {
+	rctx, ok := replyCtx.(*replyContext)
+	if !ok {
+		return fmt.Errorf("qq: SendError: invalid reply context")
+	}
+	if rctx.messageType != "group" || p.errorUserID == 0 {
+		return p.Send(ctx, replyCtx, content)
+	}
+	_, err := p.callAPI("send_private_msg", map[string]any{
+		"user_id": p.errorUserID,
+		"message": fmt.Sprintf("群 %d 报错：\n%s", rctx.groupID, content),
+	})
 	return err
 }
+
+var _ core.ErrorSender = (*Platform)(nil)
 
 // SendImage sends an image to the conversation.
 // Implements core.ImageSender.
@@ -548,7 +639,17 @@ func (p *Platform) resolveGroupName(groupID int64) string {
 
 // ── OneBot API call via WebSocket ───────────────────────────────
 
-func (p *Platform) callAPI(action string, params map[string]any) (map[string]any, error) {
+func (p *Platform) callAPI(action string, params map[string]any) (result map[string]any, apiErr error) {
+	defer func() {
+		if apiErr != nil && action == "send_group_msg" && p.errorUserID != 0 {
+			if _, err := p.callAPI("send_private_msg", map[string]any{
+				"user_id": p.errorUserID,
+				"message": fmt.Sprintf("群 %v 发送失败：\n%v", params["group_id"], apiErr),
+			}); err != nil {
+				slog.Error("qq: error notification failed", "error", err)
+			}
+		}
+	}()
 	seq := p.echoSeq.Add(1)
 	echo := strconv.FormatInt(seq, 10)
 
@@ -602,7 +703,17 @@ func (p *Platform) callAPI(action string, params map[string]any) (map[string]any
 // Used for file operations — avoids WebSocket message size limits and
 // file-path issues across Windows/WSL/Docker boundaries.
 // Requires http_url to be configured.
-func (p *Platform) callHTTPAPI(action string, params map[string]any) (map[string]any, error) {
+func (p *Platform) callHTTPAPI(action string, params map[string]any) (result map[string]any, apiErr error) {
+	defer func() {
+		if apiErr != nil && action == "upload_group_file" && p.errorUserID != 0 {
+			if _, err := p.callAPI("send_private_msg", map[string]any{
+				"user_id": p.errorUserID,
+				"message": fmt.Sprintf("群 %v 文件发送失败：\n%v", params["group_id"], apiErr),
+			}); err != nil {
+				slog.Error("qq: error notification failed", "error", err)
+			}
+		}
+	}()
 	if p.httpURL == "" {
 		return nil, fmt.Errorf("qq: http_url not configured")
 	}
@@ -616,8 +727,8 @@ func (p *Platform) callHTTPAPI(action string, params map[string]any) (map[string
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if p.token != "" {
-		req.Header.Set("Authorization", "Bearer "+p.token)
+	if p.httpToken != "" {
+		req.Header.Set("Authorization", "Bearer "+p.httpToken)
 	}
 	client := &http.Client{Timeout: 120 * time.Second}
 	resp, err := client.Do(req)
@@ -643,7 +754,6 @@ func (p *Platform) callHTTPAPI(action string, params map[string]any) (map[string
 	if apiResp.RetCode != 0 {
 		return nil, fmt.Errorf("qq: HTTP %s failed (retcode=%d, msg=%s)", action, apiResp.RetCode, apiResp.Message)
 	}
-	var result map[string]any
 	_ = json.Unmarshal(apiResp.Data, &result)
 	return result, nil
 }

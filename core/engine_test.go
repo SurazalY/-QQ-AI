@@ -3187,6 +3187,27 @@ func TestCmdList_MultiWorkspaceUsesWorkspaceSessions(t *testing.T) {
 	}
 }
 
+func TestHandlePendingPermission_AdminFromBlocksMemberApproval(t *testing.T) {
+	for _, response := range []string{"allow", "allow all", "deny"} {
+		t.Run(response, func(t *testing.T) {
+			pending := &pendingPermission{RequestID: "permission-1", Resolved: make(chan struct{})}
+			e := &Engine{
+				adminFrom: "839107207",
+				interactiveStates: map[string]*interactiveState{
+					"qq:g:706636822": {pending: pending},
+				},
+			}
+			msg := &Message{UserID: "member", SessionKey: "qq:g:706636822"}
+			if !e.handlePendingPermission(nil, msg, response, msg.SessionKey) {
+				t.Fatal("member response must be consumed without approving the tool")
+			}
+			if e.interactiveStates[msg.SessionKey].pending != pending {
+				t.Fatal("member changed the pending permission")
+			}
+		})
+	}
+}
+
 func TestHandlePendingPermission_MultiWorkspaceLookup(t *testing.T) {
 	e := newTestEngine()
 
@@ -9098,6 +9119,58 @@ func TestReapIdleWorkspaces_SkipsWorkspaceWaitingForPermission(t *testing.T) {
 	case <-done:
 	case <-time.After(3 * time.Second):
 		t.Fatal("processInteractiveMessageWith did not complete after permission")
+	}
+}
+
+func TestQueueMessageForBusySession_QuietDoesNotSendStatus(t *testing.T) {
+	key := "qq:g:706636822"
+	state := &interactiveState{}
+	e := &Engine{
+		display:           DisplayCfg{Mode: "quiet"},
+		maxQueuedMessages: 1,
+		interactiveStates: map[string]*interactiveState{key: state},
+	}
+	msg := &Message{SessionKey: key, Content: "queued conversation"}
+	if !e.queueMessageForBusySession(nil, msg, key) || len(state.pendingMessages) != 1 {
+		t.Fatal("quiet mode must queue the conversation without sending a status message")
+	}
+	if !e.queueMessageForBusySession(nil, msg, key) || len(state.pendingMessages) != 1 {
+		t.Fatal("quiet mode must not send a queue-full status message")
+	}
+}
+
+func TestQueueMessageForBusySession_MergesGroupMessagesWithSenders(t *testing.T) {
+	key := "qq:g:706636822"
+	state := &interactiveState{}
+	e := &Engine{
+		display:           DisplayCfg{Mode: "quiet"},
+		injectSender:      true,
+		maxQueuedMessages: 1,
+		interactiveStates: map[string]*interactiveState{key: state},
+	}
+	for i := 0; i < 10; i++ {
+		msg := &Message{
+			SessionKey: key, Platform: "qq", UserID: fmt.Sprintf("member%d", i),
+			Content: fmt.Sprintf("message%d", i), MessageID: fmt.Sprint(i), MergeQueued: true,
+		}
+		if i == 9 {
+			msg.Content = "[QQ：此消息直接 @ 了你] 你好"
+		}
+		if !e.queueMessageForBusySession(nil, msg, key) {
+			t.Fatal("group message was not accepted")
+		}
+	}
+	if len(state.pendingMessages) != 1 {
+		t.Fatal("busy group must have one pending batch")
+	}
+	q := state.pendingMessages[0]
+	for i := 0; i < 10; i++ {
+		if !strings.Contains(q.content, fmt.Sprintf("sender_id=member%d ", i)) {
+			t.Fatalf("missing sender %d from merged group messages", i)
+		}
+	}
+	if q.userID != "" || q.messageID != "9" || !strings.Contains(q.content, "[QQ：此消息直接 @ 了你]") {
+		t.Fatal("merged turn lost mention context or would inject the wrong sender")
 	}
 }
 
