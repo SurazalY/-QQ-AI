@@ -67,6 +67,14 @@ type acpSession struct {
 
 	callbacks           sessionCallbacks // may be nil (tests, integration harness)
 	autoApproveCommands []string
+
+	sessionKey  string
+	errorSinkMu sync.RWMutex
+	errorSink   core.MonitorErrorSink
+
+	streamErrMu   sync.Mutex
+	streamLineBuf strings.Builder
+	turnWarnCodes map[string]bool
 }
 
 type permState struct {
@@ -93,6 +101,8 @@ type acpSessionConfig struct {
 	initialModel        string           // if non-empty, applied via session/set_config_option after handshake
 	callbacks           sessionCallbacks // may be nil
 	autoApproveCommands []string
+	sessionKey          string
+	errorSink           core.MonitorErrorSink
 }
 
 func newACPSession(ctx context.Context, cfg acpSessionConfig) (*acpSession, error) {
@@ -112,12 +122,18 @@ func newACPSession(ctx context.Context, cfg acpSessionConfig) (*acpSession, erro
 		acpSessID:           cfg.resumeSessionID,
 		callbacks:           cfg.callbacks,
 		autoApproveCommands: cfg.autoApproveCommands,
+		sessionKey:          cfg.sessionKey,
+		errorSink:           cfg.errorSink,
+		turnWarnCodes:       make(map[string]bool),
 	}
 	s.alive.Store(true)
 
 	cmd := exec.CommandContext(sessionCtx, cfg.command, cfg.args...)
 	cmd.Dir = absWorkDir
-	cmd.Env = core.MergeEnv(os.Environ(), cfg.extraEnv)
+	cmd.Env = core.MergeSystemProxyEnv(core.MergeEnv(os.Environ(), cfg.extraEnv))
+	if isAgyCommand(cfg.command) {
+		detachControllingTTY(cmd)
+	}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -146,12 +162,19 @@ func newACPSession(ctx context.Context, cfg acpSessionConfig) (*acpSession, erro
 		s.tr.readLoop(sessionCtx)
 		waitErr := cmd.Wait()
 		if waitErr != nil {
-			msg := stderrBuf.String()
+			msg := strings.TrimSpace(stderrBuf.String())
 			if msg != "" {
 				slog.Error("acp: process exited", "error", waitErr, "stderr", msg)
-				s.emit(core.Event{Type: core.EventError, Error: fmt.Errorf("%s", strings.TrimSpace(msg))})
+				s.emit(core.Event{Type: core.EventError, Error: fmt.Errorf("%s", msg)})
 			} else {
 				slog.Debug("acp: process exited", "error", waitErr)
+			}
+			if sessionCtx.Err() == nil {
+				detail := msg
+				if detail == "" {
+					detail = waitErr.Error()
+				}
+				s.recordMonitorError("acp_process", "error", "PROCESS_EXIT", fmt.Sprintf("acp process exited: %v", waitErr), detail)
 			}
 		}
 		s.alive.Store(false)
@@ -412,6 +435,7 @@ func (s *acpSession) SetLiveModel(model string) bool {
 	})
 	if err != nil {
 		slog.Warn("acp: session/set_config_option model failed", "error", err, "model", model)
+		s.recordMonitorError("acp_process", "warn", "RPC_ERROR", fmt.Sprintf("acp SetLiveModel(%s) failed", model), err.Error())
 		return false
 	}
 	var resp struct {
@@ -480,6 +504,7 @@ func (s *acpSession) SetLiveMode(mode string) bool {
 			"session_id", sid,
 			"error", err,
 		)
+		s.recordMonitorError("acp_process", "warn", "RPC_ERROR", fmt.Sprintf("acp SetLiveMode(%s) failed", modeID), err.Error())
 		return false
 	}
 	s.modesMu.Lock()
@@ -540,6 +565,7 @@ func (s *acpSession) onNotification(method string, params json.RawMessage) {
 		}
 		if ev.Type == core.EventText && ev.Content != "" {
 			hasVisible = true
+			s.observeStreamText(ev.Content)
 		}
 		s.emit(ev)
 	}
@@ -898,13 +924,19 @@ func (s *acpSession) Send(prompt string, messageID string, images []core.ImageAt
 	}
 
 	slog.Debug("acp: sending session/prompt", "session_id", sid, "prompt_len", len(prompt))
+	s.resetStreamTurnState()
 	s.promptInFlight.Add(1)
 	res, err := s.tr.call(s.ctx, "session/prompt", params)
 	if err != nil {
 		s.promptInFlight.Add(-1)
+		s.flushStreamText()
+		if s.ctx.Err() == nil {
+			s.recordMonitorError("acp_process", "error", classifyACPRPCErrorCode(err.Error()), fmt.Sprintf("acp session/prompt failed: %v", err), err.Error())
+		}
 		s.emit(core.Event{Type: core.EventError, Error: err})
 		return fmt.Errorf("acp: session/prompt: %w", err)
 	}
+	s.flushStreamText()
 	slog.Debug("acp: session/prompt response", "session_id", sid, "response_len", len(res), "response", string(res))
 
 	// Absorb per-turn usage (esp. cachedReadTokens) into the context snapshot.
@@ -1042,7 +1074,9 @@ func (s *acpSession) Alive() bool {
 
 func (s *acpSession) Close() error {
 	s.alive.Store(false)
-	s.cancel()
+	if s.cancel != nil {
+		s.cancel()
+	}
 	if s.cmd != nil && s.cmd.Process != nil {
 		_ = s.cmd.Process.Kill()
 	}
@@ -1053,8 +1087,10 @@ func (s *acpSession) Close() error {
 	}()
 	select {
 	case <-done:
+		s.flushStreamText()
 		close(s.events)
 	case <-time.After(8 * time.Second):
+		s.flushStreamText()
 		slog.Warn("acp: close timed out waiting for I/O loop")
 	}
 	return nil
@@ -1097,4 +1133,150 @@ func summarizeACPToolInput(kind string, raw json.RawMessage) string {
 	}
 	b, _ := json.MarshalIndent(m, "", "  ")
 	return string(b)
+}
+
+func (s *acpSession) setErrorSink(sink core.MonitorErrorSink) {
+	s.errorSinkMu.Lock()
+	s.errorSink = sink
+	s.errorSinkMu.Unlock()
+}
+
+func (s *acpSession) recordMonitorError(source, level, code, summary, detail string) {
+	s.errorSinkMu.RLock()
+	sink := s.errorSink
+	s.errorSinkMu.RUnlock()
+	if sink == nil {
+		return
+	}
+	sessKey := s.sessionKey
+	if sessKey == "" {
+		sessKey = s.currentACPSessionID()
+	}
+	sink.RecordMonitorError(core.MonitorErrorEntry{
+		Source:     source,
+		Level:      level,
+		SessionKey: sessKey,
+		Code:       code,
+		Summary:    summary,
+		Detail:     detail,
+	})
+}
+
+func (s *acpSession) resetStreamTurnState() {
+	s.streamErrMu.Lock()
+	s.streamLineBuf.Reset()
+	s.turnWarnCodes = make(map[string]bool)
+	s.streamErrMu.Unlock()
+}
+
+func (s *acpSession) observeStreamText(chunk string) {
+	if chunk == "" {
+		return
+	}
+	var lines []string
+	s.streamErrMu.Lock()
+	s.streamLineBuf.WriteString(chunk)
+	text := s.streamLineBuf.String()
+	for {
+		idx := strings.IndexByte(text, '\n')
+		if idx < 0 {
+			break
+		}
+		lines = append(lines, text[:idx])
+		text = text[idx+1:]
+	}
+	s.streamLineBuf.Reset()
+	s.streamLineBuf.WriteString(text)
+	if s.promptInFlight.Load() == 0 && strings.TrimSpace(text) != "" {
+		lines = append(lines, text)
+		s.streamLineBuf.Reset()
+	}
+	s.streamErrMu.Unlock()
+
+	for _, line := range lines {
+		s.inspectStreamWarningLine(line)
+	}
+}
+
+func (s *acpSession) flushStreamText() {
+	s.streamErrMu.Lock()
+	rem := s.streamLineBuf.String()
+	s.streamLineBuf.Reset()
+	s.streamErrMu.Unlock()
+	if strings.TrimSpace(rem) != "" {
+		for _, line := range strings.Split(rem, "\n") {
+			s.inspectStreamWarningLine(line)
+		}
+	}
+}
+
+func (s *acpSession) inspectStreamWarningLine(rawLine string) {
+	line := strings.TrimSpace(rawLine)
+	if !strings.HasPrefix(line, "⚠") {
+		return
+	}
+
+	code, level := classifyStreamWarning(line)
+
+	s.streamErrMu.Lock()
+	if s.turnWarnCodes == nil {
+		s.turnWarnCodes = make(map[string]bool)
+	}
+	// Deduplicate repeated retry attempts for the same error class within one turn.
+	if s.turnWarnCodes[code] {
+		s.streamErrMu.Unlock()
+		return
+	}
+	// If a specific API/network error (503/EOF/429) was already recorded for this turn,
+	// skip the generic trailing termination banner so the user sees one clean root-cause entry.
+	if code == "EXEC_TERMINATED" && (s.turnWarnCodes["503"] || s.turnWarnCodes["EOF"] || s.turnWarnCodes["429"]) {
+		s.turnWarnCodes[code] = true
+		s.streamErrMu.Unlock()
+		return
+	}
+	s.turnWarnCodes[code] = true
+	s.streamErrMu.Unlock()
+
+	summary := strings.TrimSpace(strings.TrimPrefix(line, "⚠"))
+	if summary == "" {
+		summary = line
+	}
+	s.recordMonitorError("agy_stream", level, code, summary, line)
+}
+
+func classifyStreamWarning(line string) (code string, level string) {
+	lower := strings.ToLower(line)
+	switch {
+	case strings.Contains(lower, "503") ||
+		strings.Contains(lower, "unavailable") ||
+		strings.Contains(lower, "no capacity available") ||
+		strings.Contains(lower, "high traffic"):
+		return "503", "error"
+	case strings.Contains(lower, "eof") ||
+		strings.Contains(lower, "connection reset") ||
+		strings.Contains(lower, "network issue"):
+		return "EOF", "error"
+	case strings.Contains(lower, "429") ||
+		strings.Contains(lower, "rate limit") ||
+		strings.Contains(lower, "quota"):
+		return "429", "error"
+	case strings.Contains(lower, "agent execution terminated due to error"):
+		return "EXEC_TERMINATED", "error"
+	default:
+		return "STREAM_WARN", "warn"
+	}
+}
+
+func classifyACPRPCErrorCode(msg string) string {
+	lower := strings.ToLower(msg)
+	switch {
+	case strings.Contains(lower, "503") || strings.Contains(lower, "unavailable"):
+		return "503"
+	case strings.Contains(lower, "eof") || strings.Contains(lower, "connection reset"):
+		return "EOF"
+	case strings.Contains(lower, "429") || strings.Contains(lower, "rate limit"):
+		return "429"
+	default:
+		return "RPC_ERROR"
+	}
 }

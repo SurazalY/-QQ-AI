@@ -423,6 +423,7 @@ const (
 	MsgTimerAdded           MsgKey = "timer_added"
 	MsgTimerAddedExec       MsgKey = "timer_added_exec"
 	MsgTimerAddExecUsage    MsgKey = "timer_addexec_usage"
+	MsgSilentLeakDetected   MsgKey = "silent_leak_detected"
 	MsgTimerEmpty           MsgKey = "timer_empty"
 	MsgTimerListTitle       MsgKey = "timer_list_title"
 	MsgTimerListFooter      MsgKey = "timer_list_footer"
@@ -4554,6 +4555,13 @@ Environment variables CC_PROJECT and CC_SESSION_KEY are already set, so the rela
 会话在群聊里可见,每个 bot 维护自己的 relay 会话。
 
 环境变量 CC_PROJECT 和 CC_SESSION_KEY 已经设置好,relay 知道用哪个群聊。`,
+	},
+	MsgSilentLeakDetected: {
+		LangEnglish:            "⚠️ Detected %d consecutive silent turns leaking chain-of-thought into text output (suppressed from chat). The session context may be polluted — consider running `/new` to reset it.",
+		LangChinese:            "⚠️ 已连续拦截 %d 次静默轮次的思维链正文泄漏（未发送到群聊）。当前会话上下文可能已被污染，建议发送 `/new` 重置会话。",
+		LangTraditionalChinese: "⚠️ 已連續攔截 %d 次靜默輪次的思維鏈正文洩漏（未發送到群聊）。目前會話上下文可能已被污染，建議發送 `/new` 重置會話。",
+		LangJapanese:           "⚠️ サイレント応答での思考テキスト漏洩を %d 回連続で検出し送信を抑制しました。セッションコンテキストが汚染されている可能性があるため、`/new` でのリセットをおすすめします。",
+		LangSpanish:            "⚠️ Se detectaron y bloquearon %d fugas consecutivas de cadena de pensamiento en respuestas silenciosas. El contexto de la sesión puede estar contaminado; considera ejecutar `/new` para reiniciarla.",
 	},
 }
 

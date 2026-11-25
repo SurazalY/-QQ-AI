@@ -447,5 +447,85 @@
     "light": "Светлая",
     "dark": "Тёмная",
     "system": "Системная"
+  },
+  "monitor": {
+    "title": "Мониторинг сервиса",
+    "autoRefresh": "Автообновление: 10с",
+    "autoRefreshPaused": "Пауза",
+    "lastUpdated": "Обновлено {{time}}",
+    "status": {
+      "healthy": "Исправен",
+      "degraded": "Ухудшен",
+      "unhealthy": "Неисправен",
+      "unknown": "Неизвестно"
+    },
+    "health": {
+      "title": "Состояние и связность {{name}}",
+      "probeNow": "Проверить сейчас",
+      "probing": "Проверка...",
+      "cliVersion": "Версия CLI",
+      "activeModel": "Активная модель",
+      "aliveSessions": "Активные сессии ACP",
+      "lastProbe": "Последняя проверка",
+      "latency": "Задержка",
+      "failures": "Сбои подряд",
+      "nextProbe": "Следующая проверка",
+      "neverProbed": "Ещё не проверялось",
+      "platforms": "Подключения платформ",
+      "noPlatforms": "Платформы не настроены",
+      "noAgents": "Агенты не настроены",
+      "connected": "Подключено",
+      "disconnected": "Отключено",
+      "degradedSince": "Ухудшение с {{time}}",
+      "activeSessionsList": "Активные сессии ACP",
+      "alive": "активна",
+      "dead": "завершена"
+    },
+    "quota": {
+      "title": "Остаток квоты и кредитов {{name}}",
+      "activeGroup": "Активная модель",
+      "credits": "Кредиты: {{count}}",
+      "upgrade": "Улучшить",
+      "resetsIn": "Сброс через {{time}}",
+      "resetAt": "Сброс в {{time}}",
+      "resetDue": "Скоро сброс",
+      "unavailable": "Данные о квоте недоступны",
+      "unavailableHint": "Нажмите «Проверить сейчас» или дождитесь автоматической проверки использования аккаунта.",
+      "fetchedAt": "Получено {{time}}"
+    },
+    "errors": {
+      "title": "Недавние ошибки",
+      "recent15m": "15м",
+      "recent1h": "1ч",
+      "totalRetained": "Сохранено",
+      "clear": "Очистить",
+      "clearConfirmTitle": "Очистить историю ошибок",
+      "clearConfirmDesc": "Вы уверены, что хотите очистить все {{count}} сохранённых записей об ошибках? Это также очистит сохранённый файл журнала ошибок.",
+      "empty": "Недавних ошибок нет",
+      "emptyFiltered": "Нет ошибок, соответствующих текущим фильтрам",
+      "allSources": "Все",
+      "source": {
+        "agy_stream": "Поток agy",
+        "acp_process": "Процесс ACP",
+        "engine": "Engine",
+        "platform": "Платформа",
+        "probe": "Проверка"
+      },
+      "allLevels": "Все уровни",
+      "level": {
+        "error": "Ошибка",
+        "warn": "Предупреждение"
+      },
+      "showDetail": "Подробнее",
+      "hideDetail": "Скрыть"
+    },
+    "time": {
+      "now": "только что",
+      "secondsAgo": "{{count}}с назад",
+      "minutesAgo": "{{count}}м назад",
+      "hoursAgo": "{{count}}ч назад",
+      "daysAgo": "{{count}}д назад",
+      "dueNow": "Сейчас"
+    }
   }
 }

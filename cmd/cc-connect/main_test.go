@@ -471,3 +471,35 @@ func TestRunTopLevelCommandUnknown(t *testing.T) {
 		t.Fatal("runTopLevelCommand() handled unknown command")
 	}
 }
+
+type stubMainPlatform struct{}
+
+func (p *stubMainPlatform) Name() string                             { return "stub-platform" }
+func (p *stubMainPlatform) Start(core.MessageHandler) error          { return nil }
+func (p *stubMainPlatform) Reply(context.Context, any, string) error { return nil }
+func (p *stubMainPlatform) Send(context.Context, any, string) error  { return nil }
+func (p *stubMainPlatform) Stop() error                              { return nil }
+
+func TestMonitorStore_StartAfterAddPlatform_NoRace(t *testing.T) {
+	dataDir := t.TempDir()
+	eng := core.NewEngine("demo", &stubMainAgent{workDir: t.TempDir()}, []core.Platform{&stubMainPlatform{}}, filepath.Join(dataDir, "sessions.json"), core.LangEnglish)
+	ms := core.NewMonitorStore(dataDir)
+	ms.RegisterEngine("demo", eng)
+	eng.SetMonitorStore(ms)
+
+	bridgeSrv := core.NewBridgeServerInsecure(0, "", "/bridge/ws", nil)
+	if bridgeSrv == nil {
+		t.Fatal("expected non-nil bridge server in insecure mode")
+	}
+	bp := bridgeSrv.NewPlatform("demo")
+	bridgeSrv.RegisterEngine("demo", eng, bp)
+	eng.AddPlatform(bp)
+
+	ms.Start()
+	defer ms.Stop()
+
+	snap := ms.Snapshot(0)
+	if len(snap.Services.Platforms) != 2 {
+		t.Fatalf("expected 2 platforms in monitor snapshot after AddPlatform, got %d (%+v)", len(snap.Services.Platforms), snap.Services.Platforms)
+	}
+}

@@ -83,14 +83,16 @@ const (
 
 func newScopedEngine(t *testing.T) (*Engine, *stubPlatformEngine, *scopedKeyPlatform, string) {
 	t.Helper()
-	baseDir := t.TempDir()
-	shared := normalizeWorkspacePath(filepath.Join(baseDir, "repo-shared"))
-	other := normalizeWorkspacePath(filepath.Join(baseDir, "repo-other"))
+	baseDir := normalizeWorkspacePath(t.TempDir())
+	shared := filepath.Join(baseDir, "repo-shared")
+	other := filepath.Join(baseDir, "repo-other")
 	for _, dir := range []string{shared, other} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
+	shared = normalizeWorkspacePath(shared)
+	other = normalizeWorkspacePath(other)
 
 	sessionsByWorkDir := map[string][]AgentSessionInfo{
 		shared: {
@@ -198,10 +200,11 @@ func TestSessionContextForKey_AppliesDirOverride(t *testing.T) {
 	e, _, _, shared := newScopedEngine(t)
 	bindScopedTopic(e, "om_root_a", shared)
 
-	override := normalizeWorkspacePath(filepath.Join(filepath.Dir(shared), "repo-alpha"))
+	override := filepath.Join(filepath.Dir(shared), "repo-alpha")
 	if err := os.MkdirAll(override, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	override = normalizeWorkspacePath(override)
 	interactiveKey := shared + ":" + topicKeyA
 	e.projectState.SetWorkspaceDirOverride(interactiveKey, override)
 	e.projectState.Save()

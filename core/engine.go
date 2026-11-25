@@ -521,6 +521,9 @@ type Engine struct {
 
 	// Data directory for socket path injection
 	dataDir string
+
+	// Persistent monitoring error store & probe integration
+	monitorStore *MonitorStore
 }
 
 // workspaceInitFlow tracks a channel that is being onboarded to a workspace.
@@ -580,6 +583,8 @@ type interactiveState struct {
 	pendingProviderAdd       *pendingProviderAddState
 	lastAutoCompressAt       time.Time
 	lastAutoCompressTokens   int
+	consecutiveSilentLeaks   int
+	lastSilentLeakAlertAt    time.Time
 
 	// Unsolicited event reader: a background goroutine that consumes agent
 	// events between user-initiated turns (e.g. background task completions).
@@ -1127,6 +1132,95 @@ func (e *Engine) SetModelSaveFunc(fn func(model string) error) {
 // or if the engine is already running, it is started immediately.
 func (e *Engine) AddPlatform(p Platform) {
 	e.platforms = append(e.platforms, p)
+	if e.monitorStore != nil {
+		if r, ok := p.(MonitorErrorReporter); ok {
+			r.SetMonitorErrorSink(e.projectMonitorSink())
+		}
+	}
+}
+
+// SetMonitorStore attaches a MonitorStore to the engine and wires any agent or
+// platform implementing MonitorErrorReporter to emit structured errors into it.
+func (e *Engine) SetMonitorStore(ms *MonitorStore) {
+	e.monitorStore = ms
+	if ms == nil {
+		return
+	}
+	sink := e.projectMonitorSink()
+	if r, ok := e.agent.(MonitorErrorReporter); ok {
+		r.SetMonitorErrorSink(sink)
+	}
+	for _, p := range e.platforms {
+		if r, ok := p.(MonitorErrorReporter); ok {
+			r.SetMonitorErrorSink(sink)
+		}
+	}
+}
+
+type projectMonitorErrorSink struct {
+	project string
+	store   *MonitorStore
+}
+
+func (s projectMonitorErrorSink) RecordMonitorError(entry MonitorErrorEntry) {
+	if s.store == nil {
+		return
+	}
+	if entry.Project == "" {
+		entry.Project = s.project
+	}
+	s.store.RecordError(entry)
+}
+
+func (e *Engine) projectMonitorSink() MonitorErrorSink {
+	if e.monitorStore == nil {
+		return nil
+	}
+	return projectMonitorErrorSink{project: e.name, store: e.monitorStore}
+}
+
+func (e *Engine) recordMonitorError(source, level, sessionKey, code, summary, detail string) {
+	if e.monitorStore == nil {
+		return
+	}
+	e.monitorStore.RecordError(MonitorErrorEntry{
+		Source:     source,
+		Level:      level,
+		Project:    e.name,
+		SessionKey: sessionKey,
+		Code:       code,
+		Summary:    summary,
+		Detail:     detail,
+	})
+}
+
+// MonitorAgentSessionLiveness returns active interactive session counts,
+// alive process counts, and per-session liveness status.
+func (e *Engine) MonitorAgentSessionLiveness() (active int, alive int, details []MonitorAgentSessionStatus) {
+	e.interactiveMu.Lock()
+	defer e.interactiveMu.Unlock()
+	active = len(e.interactiveStates)
+	details = make([]MonitorAgentSessionStatus, 0, active)
+	for k, st := range e.interactiveStates {
+		isAlive := false
+		agentSessID := ""
+		if st != nil && st.agentSession != nil {
+			isAlive = st.agentSession.Alive()
+			agentSessID = st.agentSession.CurrentSessionID()
+		}
+		if isAlive {
+			alive++
+		}
+		details = append(details, MonitorAgentSessionStatus{
+			SessionKey:     k,
+			AgentSessionID: agentSessID,
+			Alive:          isAlive,
+		})
+	}
+	sort.Slice(details, func(i, j int) bool {
+		return details[i].SessionKey < details[j].SessionKey
+	})
+	return active, alive, details
 }
 
 func (e *Engine) SetCronScheduler(cs *CronScheduler) {
@@ -2471,6 +2565,11 @@ func (e *Engine) OnPlatformUnavailable(p Platform, err error) {
 		return
 	}
 	slog.Warn("platform unavailable", "project", e.name, "platform", p.Name(), "error", err)
+	detail := ""
+	if err != nil {
+		detail = err.Error()
+	}
+	e.recordMonitorError("platform", "error", "", "PLATFORM_UNAVAILABLE", fmt.Sprintf("platform %s unavailable", p.Name()), detail)
 }
 
 // ReceiveMessage delivers a message from a platform to the engine.
@@ -4304,6 +4403,11 @@ func (e *Engine) getOrCreateWorkspaceAgent(workspace string) (Agent, *SessionMan
 
 	ws.agent = agent
 	ws.sessions = sessions
+	if e.monitorStore != nil {
+		if r, ok := agent.(MonitorErrorReporter); ok {
+			r.SetMonitorErrorSink(e.projectMonitorSink())
+		}
+	}
 	return agent, sessions, nil
 }
 
@@ -5257,8 +5361,15 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 					fullResponse = strings.Join(textParts, "")
 				}
 
-				if fullResponse != "" {
-					for _, chunk := range SplitMessageCodeFenceAware(fullResponse, maxPlatformMessageLen) {
+				cleaned, isSilent, leakedCoT := SanitizeSilentReply(fullResponse)
+				e.noteSilentTurnOutcome(state, p, replyCtx, sessionKey, leakedCoT)
+				if leakedCoT {
+					slog.Warn("unsolicited: suppressed leaked chain-of-thought in silent reply",
+						"session", sessionKey,
+						"raw_len", len(fullResponse))
+				}
+				if !isSilent && cleaned != "" {
+					for _, chunk := range SplitMessageCodeFenceAware(cleaned, maxPlatformMessageLen) {
 						e.send(p, replyCtx, chunk)
 					}
 				}
@@ -5358,8 +5469,12 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 				// tasks keep running. Deliver buffered text before the error and
 				// keep consuming the live stream instead of abandoning its events.
 				if partial := strings.Join(textParts, ""); strings.TrimSpace(partial) != "" {
-					for _, chunk := range SplitMessageCodeFenceAware(partial, maxPlatformMessageLen) {
-						e.send(p, replyCtx, chunk)
+					cleaned, isSilent, leakedCoT := SanitizeSilentReply(partial)
+					e.noteSilentTurnOutcome(state, p, replyCtx, sessionKey, leakedCoT)
+					if !isSilent && cleaned != "" {
+						for _, chunk := range SplitMessageCodeFenceAware(cleaned, maxPlatformMessageLen) {
+							e.send(p, replyCtx, chunk)
+						}
 					}
 					session.AddHistory("assistant", partial)
 					sessions.Save()
@@ -5374,6 +5489,7 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 				}
 				if event.Error != nil {
 					slog.Error("unsolicited agent error", "error", event.Error, "session", sessionKey)
+					e.recordMonitorError("engine", "error", sessionKey, classifyMonitorErrorCode(event.Error.Error()), "unsolicited agent error", event.Error.Error())
 					e.sendError(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), event.Error))
 				}
 				state.mu.Lock()
@@ -5551,6 +5667,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			pendingSend = nil
 			if err != nil {
 				slog.Error("failed to send prompt", "error", err, "session_key", sessionKey)
+				e.recordMonitorError("engine", "error", sessionKey, classifyMonitorErrorCode(err.Error()), "failed to send prompt", err.Error())
 				sp.discard()
 				if stopTyping != nil {
 					stopTyping()
@@ -5570,6 +5687,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		case <-idleCh:
 			slog.Error("agent session idle timeout: no events for too long, killing session",
 				"session_key", sessionKey, "timeout", e.eventIdleTimeout, "elapsed", time.Since(turnStart))
+			e.recordMonitorError("engine", "error", sessionKey, "IDLE_TIMEOUT", "agent session idle timeout", fmt.Sprintf("no events for %v (elapsed %v)", e.eventIdleTimeout, time.Since(turnStart)))
 			cp.Finalize(ProgressCardStateFailed)
 			sp.discard()
 			state.mu.Lock()
@@ -6366,26 +6484,25 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 			}
 
-			// Detect NO_REPLY marker on the base response (before indicators/footer are appended).
-			// Three cases:
-			//   1. bare marker (isSilentReply)               → fully silent
-			//   2. trailing marker with non-empty reasoning  → strip marker, deliver reasoning
-			//   3. trailing marker with empty strip result   → fully silent
-			// History records the ORIGINAL baseResponse so the agent retains context of its own
-			// decision; only the outbound platform text gets rewritten/suppressed.
+			// Detect silent markers (NO_REPLY / [SILENT]) and leaked silent-turn CoT
+			// on the base response (before indicators/footer are appended).
+			// History records the ORIGINAL baseResponse so diagnostics retain what
+			// the agent emitted; only the outbound platform text gets rewritten/suppressed.
 			session.AddHistory("assistant", baseResponse)
 			sessions.Save()
 
-			isSilent := isSilentReply(baseResponse)
-			if !isSilent {
-				if stripped, ok := stripTrailingSilent(baseResponse); ok {
-					if strings.TrimSpace(stripped) == "" {
-						isSilent = true
-					} else {
-						baseResponse = stripped
-						cleanResponse = stripped
-					}
-				}
+			cleaned, isSilent, leakedCoT := SanitizeSilentReply(baseResponse)
+			e.noteSilentTurnOutcome(state, p, replyCtx, sessionKey, leakedCoT)
+			if leakedCoT {
+				slog.Warn("suppressed leaked chain-of-thought in silent reply",
+					"session", session.ID,
+					"session_key", sessionKey,
+					"raw_len", len(baseResponse),
+				)
+			}
+			if !isSilent && cleaned != baseResponse {
+				baseResponse = cleaned
+				cleanResponse = cleaned
 			}
 
 			if !isSilent {
@@ -6845,6 +6962,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			if event.Error != nil {
 				errMsg := event.Error.Error()
 				slog.Error("agent error", "error", event.Error)
+				e.recordMonitorError("engine", "error", sessionKey, classifyMonitorErrorCode(errMsg), errMsg, errMsg)
 				e.hooks.Emit(HookEvent{
 					Event:      HookEventError,
 					SessionKey: sessionKey,
@@ -6873,6 +6991,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 channelClosed:
 	// Channel closed - process exited unexpectedly
 	slog.Warn("agent process exited", "session_key", sessionKey)
+	if !state.isStopped() && e.ctx.Err() == nil {
+		e.recordMonitorError("engine", "error", sessionKey, "PROCESS_EXIT", "agent process exited unexpectedly", "")
+	}
 	state.mu.Lock()
 	state.eventsNeedResync = true
 	state.mu.Unlock()
@@ -6891,19 +7012,15 @@ channelClosed:
 		// the partial assistant response if the process exits next.
 		sessions.Save()
 
-		// Respect NO_REPLY even on abnormal exit so silent turns stay silent.
-		if isSilentReply(fullResponse) {
+		// Respect NO_REPLY / [SILENT] and leaked silent CoT even on abnormal exit.
+		cleaned, isSilent, leakedCoT := SanitizeSilentReply(fullResponse)
+		e.noteSilentTurnOutcome(state, p, replyCtx, sessionKey, leakedCoT)
+		if isSilent {
 			sp.discard()
-			slog.Info("silent reply suppressed (channel closed)", "session", session.ID)
+			slog.Info("silent reply suppressed (channel closed)", "session", session.ID, "leaked_cot", leakedCoT)
 			return
 		}
-		if stripped, ok := stripTrailingSilent(fullResponse); ok {
-			if strings.TrimSpace(stripped) == "" {
-				sp.discard()
-				return
-			}
-			fullResponse = stripped
-		}
+		fullResponse = cleaned
 
 		e.hooks.Emit(HookEvent{
 			Event:      HookEventMessageSent,
@@ -12696,6 +12813,9 @@ func (e *Engine) sendAlreadyRenderedWithError(p Platform, replyCtx any, content 
 		} else {
 			slog.Error("platform send failed", "platform", p.Name(), "error", err, "content_len", len(content))
 		}
+		if _, hasReporter := p.(MonitorErrorReporter); !hasReporter {
+			e.recordMonitorError("platform", "error", "", "PLATFORM_ERROR", fmt.Sprintf("platform %s send failed", p.Name()), err.Error())
+		}
 		return err
 	}
 	if elapsed := time.Since(start); elapsed >= slowPlatformSend {
@@ -12713,6 +12833,9 @@ func (e *Engine) sendError(p Platform, replyCtx any, content string) {
 		}
 		if err := sender.SendError(e.ctx, replyCtx, content); err != nil {
 			slog.Error("error notification failed", "platform", p.Name(), "error", err)
+			if _, hasReporter := p.(MonitorErrorReporter); !hasReporter {
+				e.recordMonitorError("platform", "error", "", "PLATFORM_ERROR", fmt.Sprintf("platform %s error notification failed", p.Name()), err.Error())
+			}
 		}
 		return
 	}
@@ -12766,6 +12889,9 @@ func (e *Engine) replyWithError(p Platform, replyCtx any, content string) error 
 	start := time.Now()
 	if err := p.Reply(e.ctx, replyCtx, content); err != nil {
 		slog.Error("platform reply failed", "platform", p.Name(), "error", err, "content_len", len(content))
+		if _, hasReporter := p.(MonitorErrorReporter); !hasReporter {
+			e.recordMonitorError("platform", "error", "", "PLATFORM_ERROR", fmt.Sprintf("platform %s reply failed", p.Name()), err.Error())
+		}
 		return err
 	}
 	if elapsed := time.Since(start); elapsed >= slowPlatformSend {
@@ -17874,23 +18000,87 @@ func stripAgentFooterLines(text string) string {
 	return strings.TrimRight(strings.Join(kept, "\n"), "\n ")
 }
 
-// silentReplyRe matches a bare NO_REPLY marker (case-insensitive, optional surrounding whitespace).
-// When the agent emits exactly this as its full response, the platform send is suppressed
-// so the agent stays silent in group chats where a reply would be noise.
-var silentReplyRe = regexp.MustCompile(`(?i)^\s*NO_REPLY\s*$`)
+const (
+	silentLeakAlertThreshold = 2
+	silentLeakAlertCooldown  = 10 * time.Minute
+)
 
-// silentReplyTrailingRe matches a trailing NO_REPLY marker preceded by whitespace or
-// markdown emphasis (`*`). Lets agents that narrate their reasoning before the marker
-// still suppress the marker from the delivered text (mirroring OpenClaw's stripSilentToken).
-var silentReplyTrailingRe = regexp.MustCompile(`(?i)(?:^|\s+|\*+)NO_REPLY\s*$`)
+// silentReplyRe matches one or more bare NO_REPLY or [SILENT] markers (case-insensitive,
+// optional surrounding whitespace). When the agent emits only silent markers as its full
+// response, the platform send is suppressed so the agent stays silent in group chats.
+var silentReplyRe = regexp.MustCompile(`(?i)^\s*(?:NO_REPLY|\[SILENT\])(?:\s+(?:NO_REPLY|\[SILENT\]))*\s*$`)
 
-// isSilentReply reports whether text is exactly a NO_REPLY marker.
+// silentReplyTrailingRe matches a trailing NO_REPLY or [SILENT] marker preceded by
+// whitespace or markdown emphasis (`*`). Lets agents that emit visible text before the
+// marker still suppress the marker from the delivered text.
+var silentReplyTrailingRe = regexp.MustCompile(`(?i)(?:^|\s+|\*+)(?:NO_REPLY|\[SILENT\])\s*$`)
+
+// silentReplyLeadingLineRe matches one or more standalone leading NO_REPLY / [SILENT] lines.
+var silentReplyLeadingLineRe = regexp.MustCompile(`(?i)^(?:\s*(?:NO_REPLY|\[SILENT\])\s*\r?\n)+`)
+
+// silentLeakGluedPrefixRe matches a silent marker immediately glued to any
+// non-whitespace suffix (e.g. "[SILENT]tmp\n...", "NO_REPLY旅\n", "NO_REPLYx"),
+// optionally preceded by standalone silent markers. Some models occasionally sample
+// an unintended token instead of EOS right after a bare silent marker.
+var silentLeakGluedPrefixRe = regexp.MustCompile(`(?i)^\s*(?:(?:NO_REPLY|\[SILENT\])\s+)*(?:NO_REPLY|\[SILENT\])\S`)
+
+// silentLeakSameLineTailRe matches a reply starting with NO_REPLY / [SILENT]
+// followed by horizontal whitespace and trailing tokens on the same line
+// (e.g. "NO_REPLY 旅", "NO_REPLY (silent)", "[SILENT] wait..."). Legitimate replies
+// preceded by an accidental silent line start on the next line after a newline.
+var silentLeakSameLineTailRe = regexp.MustCompile(`(?i)^\s*(?:(?:NO_REPLY|\[SILENT\])\s+)*(?:NO_REPLY|\[SILENT\])[ \t]+\S`)
+
+// silentLeakLeadingMarkerRe matches text that begins with a silent marker.
+var silentLeakLeadingMarkerRe = regexp.MustCompile(`(?i)^\s*(?:\[SILENT\]|NO_REPLY(?:[\s\p{P}]|$))`)
+
+// silentLeakTrailingMarkerRe matches text ending with a silent marker (including glued
+// punctuation such as ".[SILENT]" or "。[SILENT]").
+var silentLeakTrailingMarkerRe = regexp.MustCompile(`(?i)(?:\[SILENT\]|(?:^|[\s\p{P}\*])NO_REPLY)\s*$`)
+
+// silentLeakFragmentRe matches stray partial silent-marker fragments from split chunks.
+var silentLeakFragmentRe = regexp.MustCompile(`(?i)^\s*(?:SILENT\]|\[SILENT)\s*$`)
+
+var silentCoTMetaIndicators = []string{
+	"inside thought",
+	"in thought",
+	"end thought",
+	"close thought",
+	"output only",
+	"output strictly",
+	"strictly `[silent]`",
+	"strictly `no_reply`",
+	"just output `[silent]`",
+	"just output `no_reply`",
+	"should just output `[silent]`",
+	"should just output `no_reply`",
+	"don't repeat `[silent]`",
+	"don't repeat `no_reply`",
+	"my final response must be",
+	"只输出静默",
+	"仅输出静默",
+	"输出静默标记",
+	"结束思考",
+	"思考过程里",
+	"在 thought",
+}
+
+func containsSilentCoTMeta(text string) bool {
+	lower := strings.ToLower(text)
+	for _, kw := range silentCoTMetaIndicators {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// isSilentReply reports whether text consists solely of silent markers (NO_REPLY or [SILENT]).
 func isSilentReply(text string) bool {
 	return silentReplyRe.MatchString(text)
 }
 
-// stripTrailingSilent removes a trailing NO_REPLY marker and returns the stripped text
-// along with whether a strip occurred. Caller must first check isSilentReply for the
+// stripTrailingSilent removes a trailing NO_REPLY or [SILENT] marker and returns the stripped
+// text along with whether a strip occurred. Caller must first check isSilentReply for the
 // bare-marker case; this helper assumes mixed content.
 func stripTrailingSilent(text string) (string, bool) {
 	stripped := silentReplyTrailingRe.ReplaceAllString(text, "")
@@ -17900,15 +18090,98 @@ func stripTrailingSilent(text string) (string, bool) {
 	return strings.TrimRight(stripped, " \t\r\n"), true
 }
 
+// SanitizeSilentReply normalizes an assistant reply against silent markers (NO_REPLY / [SILENT])
+// and detects chain-of-thought spillover on turns intended to stay silent (e.g. "[SILENT]tmp\n...").
+//
+// Return values:
+//   - cleaned: deliverable text when silent is false (with any stray leading/trailing markers stripped)
+//   - silent: true when nothing should be sent to the chat
+//   - leakedCoT: true when the turn was suppressed specifically due to leaked thinking text
+func SanitizeSilentReply(text string) (cleaned string, silent bool, leakedCoT bool) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return "", false, false
+	}
+	if isSilentReply(trimmed) {
+		return "", true, false
+	}
+	if silentLeakFragmentRe.MatchString(trimmed) {
+		return "", true, true
+	}
+	if silentLeakGluedPrefixRe.MatchString(trimmed) || silentLeakSameLineTailRe.MatchString(trimmed) {
+		return "", true, true
+	}
+
+	startsSilent := silentLeakLeadingMarkerRe.MatchString(trimmed)
+	endsSilent := silentLeakTrailingMarkerRe.MatchString(trimmed)
+	hasCoTMeta := containsSilentCoTMeta(trimmed)
+
+	// A reply bracketed by silent markers at both ends was meant to be silent.
+	// If it only wraps a service warning banner (⚠), keep it silent without counting as CoT leak.
+	if startsSilent && endsSilent {
+		if strings.Contains(trimmed, "⚠") && !hasCoTMeta {
+			return "", true, false
+		}
+		return "", true, true
+	}
+	if (startsSilent || endsSilent) && hasCoTMeta {
+		return "", true, true
+	}
+
+	// Strip stray leading standalone silent lines (e.g. repeated "[SILENT]\n" before a real reply)
+	// and any trailing silent marker.
+	out := text
+	if loc := silentReplyLeadingLineRe.FindStringIndex(out); loc != nil {
+		out = out[loc[1]:]
+	}
+	if stripped, ok := stripTrailingSilent(out); ok {
+		out = stripped
+	}
+	if strings.TrimSpace(out) == "" {
+		return "", true, false
+	}
+	return out, false, false
+}
+
+func (e *Engine) noteSilentTurnOutcome(state *interactiveState, p Platform, replyCtx any, sessionKey string, leakedCoT bool) {
+	if state == nil {
+		return
+	}
+	if !leakedCoT {
+		state.mu.Lock()
+		state.consecutiveSilentLeaks = 0
+		state.mu.Unlock()
+		return
+	}
+
+	now := time.Now()
+	state.mu.Lock()
+	state.consecutiveSilentLeaks++
+	count := state.consecutiveSilentLeaks
+	shouldAlert := count >= silentLeakAlertThreshold &&
+		(state.lastSilentLeakAlertAt.IsZero() || now.Sub(state.lastSilentLeakAlertAt) >= silentLeakAlertCooldown)
+	if shouldAlert {
+		state.lastSilentLeakAlertAt = now
+	}
+	state.mu.Unlock()
+
+	e.recordMonitorError("engine", "warn", sessionKey, "COT_LEAK_SUPPRESSED",
+		fmt.Sprintf("suppressed leaked chain-of-thought in silent reply (streak=%d)", count), "")
+	if shouldAlert && p != nil {
+		e.sendError(p, replyCtx, e.i18n.Tf(MsgSilentLeakDetected, count))
+	}
+}
+
 // couldBeSilentPrefix reports whether the trimmed text is still a case-insensitive
-// prefix of "NO_REPLY". Used during streaming to hold the preview until we know
-// whether the response will resolve to a pure NO_REPLY marker.
+// prefix of "NO_REPLY" or "[SILENT]". Used during streaming to hold the preview until
+// we know whether the response will resolve to a pure silent marker.
 func couldBeSilentPrefix(text string) bool {
 	t := strings.TrimSpace(text)
 	if t == "" {
 		return true
 	}
-	return strings.HasPrefix("NO_REPLY", strings.ToUpper(t))
+	upper := strings.ToUpper(t)
+	return strings.HasPrefix("NO_REPLY", upper) || strings.HasPrefix("[SILENT]", upper)
 }
 
 func isEllipsisOnly(text string) bool {

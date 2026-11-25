@@ -108,7 +108,7 @@ func writeWorkspaceSkill(t *testing.T, root, name, body string) {
 }
 func newWorkspaceSkillsEngine(t *testing.T, p Platform) (*Engine, string, string) {
 	t.Helper()
-	base := t.TempDir()
+	base := normalizeWorkspacePath(t.TempDir())
 	a, b, global := filepath.Join(base, "a"), filepath.Join(base, "b"), filepath.Join(base, "global")
 	for _, ws := range []string{a, b} {
 		writeWorkspaceSkill(t, filepath.Join(ws, ".agents", "skills"), filepath.Base(ws)+"-only", "Unique "+filepath.Base(ws))
@@ -116,6 +116,9 @@ func newWorkspaceSkillsEngine(t *testing.T, p Platform) (*Engine, string, string
 	}
 	writeWorkspaceSkill(t, global, "global-skill", "Global instructions")
 	writeWorkspaceSkill(t, global, "shared-skill", "Wrong global instructions")
+	a = normalizeWorkspacePath(a)
+	b = normalizeWorkspacePath(b)
+	global = normalizeWorkspacePath(global)
 	name := "workspace-skills-" + t.Name()
 	RegisterAgent(name, func(opts map[string]any) (Agent, error) {
 		return &workspaceSkillAgent{name: name, workDir: opts["work_dir"].(string), global: global}, nil

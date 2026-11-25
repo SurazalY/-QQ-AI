@@ -447,5 +447,85 @@
     "light": "Claro",
     "dark": "Oscuro",
     "system": "Sistema"
+  },
+  "monitor": {
+    "title": "Monitor de servicio",
+    "autoRefresh": "Auto-actualizar: 10s",
+    "autoRefreshPaused": "Pausado",
+    "lastUpdated": "Actualizado {{time}}",
+    "status": {
+      "healthy": "Saludable",
+      "degraded": "Degradado",
+      "unhealthy": "No saludable",
+      "unknown": "Desconocido"
+    },
+    "health": {
+      "title": "Conectividad y estado de {{name}}",
+      "probeNow": "Sondear ahora",
+      "probing": "Sondeando...",
+      "cliVersion": "Versión CLI",
+      "activeModel": "Modelo activo",
+      "aliveSessions": "Sesiones ACP activas",
+      "lastProbe": "Último sondeo",
+      "latency": "Latencia",
+      "failures": "Fallos consecutivos",
+      "nextProbe": "Próximo sondeo automático",
+      "neverProbed": "Sin sondeos aún",
+      "platforms": "Conexiones de plataforma",
+      "noPlatforms": "Sin plataformas configuradas",
+      "noAgents": "Sin agentes configurados",
+      "connected": "Conectado",
+      "disconnected": "Desconectado",
+      "degradedSince": "Degradado desde {{time}}",
+      "activeSessionsList": "Sesiones ACP activas",
+      "alive": "activa",
+      "dead": "finalizada"
+    },
+    "quota": {
+      "title": "Cuota y créditos restantes de {{name}}",
+      "activeGroup": "Modelo activo",
+      "credits": "Créditos: {{count}}",
+      "upgrade": "Mejorar",
+      "resetsIn": "Se restablece en {{time}}",
+      "resetAt": "Se restablece a las {{time}}",
+      "resetDue": "Restableciendo pronto",
+      "unavailable": "Datos de cuota no disponibles",
+      "unavailableHint": "Haz clic en \"Sondear ahora\" o espera al sondeo automático para obtener el uso de la cuenta.",
+      "fetchedAt": "Obtenido {{time}}"
+    },
+    "errors": {
+      "title": "Errores recientes",
+      "recent15m": "15m",
+      "recent1h": "1h",
+      "totalRetained": "Retenidos",
+      "clear": "Limpiar",
+      "clearConfirmTitle": "Limpiar historial de errores",
+      "clearConfirmDesc": "¿Seguro que deseas limpiar las {{count}} entradas de error retenidas? Esto también truncará el registro de errores persistido.",
+      "empty": "Sin errores recientes",
+      "emptyFiltered": "Ningún error coincide con los filtros actuales",
+      "allSources": "Todos",
+      "source": {
+        "agy_stream": "Flujo agy",
+        "acp_process": "Proceso ACP",
+        "engine": "Engine",
+        "platform": "Plataforma",
+        "probe": "Sondeo"
+      },
+      "allLevels": "Todos los niveles",
+      "level": {
+        "error": "Error",
+        "warn": "Aviso"
+      },
+      "showDetail": "Detalle",
+      "hideDetail": "Ocultar"
+    },
+    "time": {
+      "now": "justo ahora",
+      "secondsAgo": "hace {{count}}s",
+      "minutesAgo": "hace {{count}}m",
+      "hoursAgo": "hace {{count}}h",
+      "daysAgo": "hace {{count}}d",
+      "dueNow": "Ahora"
+    }
   }
 }

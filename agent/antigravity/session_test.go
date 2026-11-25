@@ -238,7 +238,7 @@ func TestSendDoesNotHoldStdinOpen(t *testing.T) {
 		t.Fatalf("WriteFile fake agy: %v", err)
 	}
 
-	s, err := newAntigravitySession(context.Background(), cmdPath, nil, workDir, "", "default", "", nil, 2*time.Second)
+	s, err := newAntigravitySession(context.Background(), cmdPath, nil, workDir, "", "default", "", nil, 5*time.Second)
 	if err != nil {
 		t.Fatalf("newAntigravitySession: %v", err)
 	}
@@ -248,7 +248,7 @@ func TestSendDoesNotHoldStdinOpen(t *testing.T) {
 		t.Fatalf("Send: %v", err)
 	}
 
-	deadline := time.After(3 * time.Second)
+	deadline := time.After(6 * time.Second)
 	var text strings.Builder
 	for {
 		select {

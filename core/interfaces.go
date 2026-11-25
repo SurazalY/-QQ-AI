@@ -715,3 +715,75 @@ const (
 type PreviewStatusUpdater interface {
 	SetPreviewStatus(previewHandle any, status CardStatus)
 }
+
+// MonitorErrorEntry is a structured error or warning reported to the persistent
+// monitoring error store by core, agents, or platforms.
+type MonitorErrorEntry struct {
+	Source     string `json:"source"`
+	Level      string `json:"level"`
+	Project    string `json:"project,omitempty"`
+	SessionKey string `json:"session_key,omitempty"`
+	Code       string `json:"code,omitempty"`
+	Summary    string `json:"summary"`
+	Detail     string `json:"detail,omitempty"`
+}
+
+// MonitorErrorSink receives structured error events for monitoring persistence.
+type MonitorErrorSink interface {
+	RecordMonitorError(entry MonitorErrorEntry)
+}
+
+// MonitorErrorReporter is an optional interface for agents and platforms that
+// report runtime errors/warnings directly to a MonitorErrorSink.
+type MonitorErrorReporter interface {
+	SetMonitorErrorSink(sink MonitorErrorSink)
+}
+
+// MonitorQuotaBucket describes a single quota window bucket (e.g. 5h, weekly).
+type MonitorQuotaBucket struct {
+	ID                string  `json:"id"`
+	Name              string  `json:"name"`
+	Description       string  `json:"description,omitempty"`
+	Window            string  `json:"window"`
+	RemainingFraction float64 `json:"remaining_fraction"`
+	RemainingPercent  float64 `json:"remaining_percent"`
+	ResetTime         string  `json:"reset_time,omitempty"`
+}
+
+// MonitorQuotaGroup groups quota buckets for a family of models.
+type MonitorQuotaGroup struct {
+	Name                string               `json:"name"`
+	Description         string               `json:"description,omitempty"`
+	IsCurrentModelGroup bool                 `json:"is_current_model_group"`
+	Buckets             []MonitorQuotaBucket `json:"buckets"`
+}
+
+// MonitorQuotaCredits holds optional account credit balance metadata.
+type MonitorQuotaCredits struct {
+	RemainingCredits float64 `json:"remaining_credits"`
+	UpgradeURI       string  `json:"upgrade_uri,omitempty"`
+}
+
+// MonitorQuota represents an agent's account quota and credit snapshot.
+type MonitorQuota struct {
+	FetchedAt   string               `json:"fetched_at"`
+	ActiveModel string               `json:"active_model,omitempty"`
+	Description string               `json:"description,omitempty"`
+	Groups      []MonitorQuotaGroup  `json:"groups"`
+	Credits     *MonitorQuotaCredits `json:"credits,omitempty"`
+}
+
+// MonitorProbeReport is returned by AgentMonitorProber.ProbeMonitor.
+type MonitorProbeReport struct {
+	CLIBinary    string        `json:"cli_binary,omitempty"`
+	CLIVersion   string        `json:"cli_version,omitempty"`
+	ActiveModel  string        `json:"active_model,omitempty"`
+	Quota        *MonitorQuota `json:"quota,omitempty"`
+	PartialError string        `json:"partial_error,omitempty"`
+}
+
+// AgentMonitorProber is an optional interface for agents that support active
+// health and quota probing for monitoring dashboards.
+type AgentMonitorProber interface {
+	ProbeMonitor(ctx context.Context) (*MonitorProbeReport, error)
+}

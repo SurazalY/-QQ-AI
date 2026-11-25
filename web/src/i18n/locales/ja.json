@@ -447,5 +447,85 @@
     "light": "ライト",
     "dark": "ダーク",
     "system": "システムに合わせる"
+  },
+  "monitor": {
+    "title": "サービス監視",
+    "autoRefresh": "自動更新: 10秒",
+    "autoRefreshPaused": "一時停止中",
+    "lastUpdated": "更新: {{time}}",
+    "status": {
+      "healthy": "正常",
+      "degraded": "低下",
+      "unhealthy": "異常",
+      "unknown": "不明"
+    },
+    "health": {
+      "title": "{{name}} 接続性とヘルス状態",
+      "probeNow": "今すぐプローブ",
+      "probing": "プローブ中...",
+      "cliVersion": "CLI バージョン",
+      "activeModel": "現在のモデル",
+      "aliveSessions": "ACP 稼働セッション",
+      "lastProbe": "最終プローブ",
+      "latency": "レイテンシ",
+      "failures": "連続失敗回数",
+      "nextProbe": "次回自動プローブ",
+      "neverProbed": "未プローブ",
+      "platforms": "プラットフォーム接続",
+      "noPlatforms": "プラットフォーム未設定",
+      "noAgents": "エージェント未設定",
+      "connected": "接続済み",
+      "disconnected": "未接続",
+      "degradedSince": "低下開始: {{time}}",
+      "activeSessionsList": "稼働中の ACP セッション",
+      "alive": "稼働中",
+      "dead": "終了"
+    },
+    "quota": {
+      "title": "{{name}} 残りクォータとクレジット",
+      "activeGroup": "現在のモデル",
+      "credits": "クレジット: {{count}}",
+      "upgrade": "アップグレード",
+      "resetsIn": "{{time}} 後にリセット",
+      "resetAt": "リセット時刻: {{time}}",
+      "resetDue": "まもなくリセット",
+      "unavailable": "クォータ情報なし",
+      "unavailableHint": "「今すぐプローブ」をクリックするか、自動プローブによる使用状況の取得をお待ちください。",
+      "fetchedAt": "取得: {{time}}"
+    },
+    "errors": {
+      "title": "最近のエラー",
+      "recent15m": "15分",
+      "recent1h": "1時間",
+      "totalRetained": "保持数",
+      "clear": "クリア",
+      "clearConfirmTitle": "エラー履歴をクリア",
+      "clearConfirmDesc": "保持されている全 {{count}} 件のエラーエントリをクリアしますか？永続化されたエラーログも切り詰められます。",
+      "empty": "最近のエラーはありません",
+      "emptyFiltered": "現在のフィルターに一致するエラーはありません",
+      "allSources": "すべて",
+      "source": {
+        "agy_stream": "agy ストリーム",
+        "acp_process": "ACP プロセス",
+        "engine": "Engine",
+        "platform": "プラットフォーム",
+        "probe": "プローブ"
+      },
+      "allLevels": "すべて",
+      "level": {
+        "error": "エラー",
+        "warn": "警告"
+      },
+      "showDetail": "詳細",
+      "hideDetail": "隠す"
+    },
+    "time": {
+      "now": "たった今",
+      "secondsAgo": "{{count}}秒前",
+      "minutesAgo": "{{count}}分前",
+      "hoursAgo": "{{count}}時間前",
+      "daysAgo": "{{count}}日前",
+      "dueNow": "まもなく実行"
+    }
   }
 }

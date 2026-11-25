@@ -73,6 +73,9 @@ type ManagementServer struct {
 
 	// cc-switch migration callback
 	listCCSwitchProviders func() ([]CCSwitchProviderInfo, error)
+
+	// Monitoring & persistent error store
+	monitorStore *MonitorStore
 }
 
 // NewManagementServer creates a new management API server.
@@ -88,8 +91,36 @@ func NewManagementServer(port int, token string, corsOrigins []string) *Manageme
 
 func (m *ManagementServer) RegisterEngine(name string, e *Engine) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.engines[name] = e
+	ms := m.monitorStore
+	m.mu.Unlock()
+	if ms != nil {
+		ms.RegisterEngine(name, e)
+	}
+}
+
+func (m *ManagementServer) SetMonitorStore(ms *MonitorStore) {
+	m.mu.Lock()
+	m.monitorStore = ms
+	if ms != nil {
+		for name, e := range m.engines {
+			ms.RegisterEngine(name, e)
+		}
+	}
+	m.mu.Unlock()
+}
+
+func (m *ManagementServer) ensureMonitorStore() *MonitorStore {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.monitorStore == nil {
+		ms := NewMonitorStore("")
+		for name, e := range m.engines {
+			ms.RegisterEngine(name, e)
+		}
+		m.monitorStore = ms
+	}
+	return m.monitorStore
 }
 
 func (m *ManagementServer) SetCronScheduler(cs *CronScheduler)           { m.cronScheduler = cs }
@@ -223,6 +254,11 @@ func (m *ManagementServer) buildHandler(mux *http.ServeMux) http.Handler {
 	mux.HandleFunc(prefix+"/reload", m.wrap(m.handleReload))
 	mux.HandleFunc(prefix+"/config", m.wrap(m.handleConfig))
 	mux.HandleFunc(prefix+"/settings", m.wrap(m.handleGlobalSettings))
+
+	// Monitoring
+	mux.HandleFunc(prefix+"/monitor", m.wrap(m.handleMonitor))
+	mux.HandleFunc(prefix+"/monitor/errors", m.wrap(m.handleMonitorErrors))
+	mux.HandleFunc(prefix+"/monitor/probe", m.wrap(m.handleMonitorProbe))
 
 	// Agents & Platforms (registry)
 	mux.HandleFunc(prefix+"/agents", m.wrap(m.handleAgents))
@@ -415,9 +451,9 @@ func (m *ManagementServer) handleStatus(w http.ResponseWriter, r *http.Request) 
 				info := ph.PlatformHealth()
 				if info.Degraded {
 					entry := map[string]any{
-						"name":    info.Name,
-						"reason":  info.DegradedReason,
-						"since":   info.DegradedSince,
+						"name":   info.Name,
+						"reason": info.DegradedReason,
+						"since":  info.DegradedSince,
 					}
 					degradedEntries = append(degradedEntries, entry)
 				}
@@ -1131,6 +1167,7 @@ func (m *ManagementServer) handleProjectSessions(w http.ResponseWriter, r *http.
 	switch r.Method {
 	case http.MethodGet:
 		activeKeys := make(map[string]string) // sessionKey → platform
+		aliveKeys := make(map[string]bool)    // sessionKey → AgentSession.Alive()
 		e.interactiveMu.Lock()
 		for key, state := range e.interactiveStates {
 			pName := ""
@@ -1138,6 +1175,7 @@ func (m *ManagementServer) handleProjectSessions(w http.ResponseWriter, r *http.
 				pName = state.platform.Name()
 			}
 			activeKeys[key] = pName
+			aliveKeys[key] = state != nil && state.agentSession != nil && state.agentSession.Alive()
 		}
 		e.interactiveMu.Unlock()
 
@@ -1174,7 +1212,7 @@ func (m *ManagementServer) handleProjectSessions(w http.ResponseWriter, r *http.
 			s.mu.Unlock()
 
 			sessionKey := idToKey[s.ID]
-			_, live := activeKeys[sessionKey]
+			live := aliveKeys[sessionKey]
 			info["live"] = live
 			if p, ok := activeKeys[sessionKey]; ok {
 				info["platform"] = p
@@ -2240,4 +2278,61 @@ func (m *ManagementServer) handleSkillPresets(w http.ResponseWriter, r *http.Req
 		return
 	}
 	mgmtJSON(w, http.StatusOK, data)
+}
+
+// ── Monitoring endpoints ───────────────────────────────────────
+
+func (m *ManagementServer) handleMonitor(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		mgmtError(w, http.StatusMethodNotAllowed, "GET only")
+		return
+	}
+	ms := m.ensureMonitorStore()
+	uptime := int(time.Since(m.startedAt).Seconds())
+	mgmtJSON(w, http.StatusOK, ms.Snapshot(uptime))
+}
+
+func (m *ManagementServer) handleMonitorErrors(w http.ResponseWriter, r *http.Request) {
+	ms := m.ensureMonitorStore()
+	switch r.Method {
+	case http.MethodGet:
+		q := r.URL.Query()
+		source := q.Get("source")
+		level := q.Get("level")
+		limit := defaultMonitorPreviewItems
+		if raw := strings.TrimSpace(q.Get("limit")); raw != "" {
+			n, err := strconv.Atoi(raw)
+			if err != nil || n <= 0 {
+				mgmtError(w, http.StatusBadRequest, "invalid limit parameter")
+				return
+			}
+			limit = n
+		}
+		mgmtJSON(w, http.StatusOK, ms.QueryErrors(source, level, limit))
+	case http.MethodDelete:
+		if err := ms.ClearErrors(); err != nil {
+			mgmtError(w, http.StatusInternalServerError, "clear errors failed: "+err.Error())
+			return
+		}
+		mgmtJSON(w, http.StatusOK, map[string]any{
+			"message":        "errors cleared",
+			"total_retained": 0,
+		})
+	default:
+		mgmtError(w, http.StatusMethodNotAllowed, "GET or DELETE only")
+	}
+}
+
+func (m *ManagementServer) handleMonitorProbe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		mgmtError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	ms := m.ensureMonitorStore()
+	uptime := int(time.Since(m.startedAt).Seconds())
+	snap := ms.ProbeNowWithUptime(r.Context(), uptime)
+	if r.Context().Err() != nil {
+		return
+	}
+	mgmtJSON(w, http.StatusOK, snap)
 }

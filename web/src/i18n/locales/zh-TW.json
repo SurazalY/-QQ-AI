@@ -447,5 +447,85 @@
     "light": "淺色",
     "dark": "深色",
     "system": "跟隨系統"
+  },
+  "monitor": {
+    "title": "持續運行監控",
+    "autoRefresh": "自動重新整理: 10s",
+    "autoRefreshPaused": "已暫停",
+    "lastUpdated": "更新於 {{time}}",
+    "status": {
+      "healthy": "健康",
+      "degraded": "降級",
+      "unhealthy": "異常",
+      "unknown": "未知"
+    },
+    "health": {
+      "title": "{{name}} 連通健康性",
+      "probeNow": "立即探測",
+      "probing": "探測中...",
+      "cliVersion": "CLI 版本",
+      "activeModel": "目前活躍模型",
+      "aliveSessions": "ACP 存活工作階段",
+      "lastProbe": "最近探測",
+      "latency": "探測延遲",
+      "failures": "連續失敗",
+      "nextProbe": "下次自動探測",
+      "neverProbed": "尚未探測",
+      "platforms": "平台連線狀態",
+      "noPlatforms": "未設定平台",
+      "noAgents": "未設定 Agent",
+      "connected": "已連線",
+      "disconnected": "未連線",
+      "degradedSince": "降級始於 {{time}}",
+      "activeSessionsList": "活躍 ACP 工作階段",
+      "alive": "存活",
+      "dead": "已結束"
+    },
+    "quota": {
+      "title": "{{name}} 剩餘額度",
+      "activeGroup": "目前模型",
+      "credits": "Credits: {{count}}",
+      "upgrade": "升級",
+      "resetsIn": "{{time}} 後重置",
+      "resetAt": "重置時間 {{time}}",
+      "resetDue": "即將重置",
+      "unavailable": "暫無額度資料",
+      "unavailableHint": "可點擊「立即探測」或等待自動探測取得帳號剩餘額度。",
+      "fetchedAt": "取得於 {{time}}"
+    },
+    "errors": {
+      "title": "近期錯誤",
+      "recent15m": "15 分鐘內",
+      "recent1h": "1 小時內",
+      "totalRetained": "總保留",
+      "clear": "清空",
+      "clearConfirmTitle": "清空錯誤記錄",
+      "clearConfirmDesc": "確定要清空全部 {{count}} 條錯誤記錄嗎？這也會清空本機持久化記錄檔。",
+      "empty": "暫無錯誤記錄",
+      "emptyFiltered": "目前篩選條件下無錯誤記錄",
+      "allSources": "全部",
+      "source": {
+        "agy_stream": "agy 串流錯誤",
+        "acp_process": "ACP 處理程序",
+        "engine": "Engine",
+        "platform": "平台",
+        "probe": "探測"
+      },
+      "allLevels": "全部層級",
+      "level": {
+        "error": "錯誤",
+        "warn": "警告"
+      },
+      "showDetail": "詳情",
+      "hideDetail": "收合"
+    },
+    "time": {
+      "now": "剛剛",
+      "secondsAgo": "{{count}} 秒前",
+      "minutesAgo": "{{count}} 分鐘前",
+      "hoursAgo": "{{count}} 小時前",
+      "daysAgo": "{{count}} 天前",
+      "dueNow": "即將執行"
+    }
   }
 }

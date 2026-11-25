@@ -117,17 +117,6 @@ func TestMapSessionUpdate_FallbackTextExtraction(t *testing.T) {
 			}`,
 			want: "vendor message",
 		},
-		{
-			name: "unknown kind with content.text",
-			params: `{
-				"sessionId": "s1",
-				"update": {
-					"sessionUpdate": "custom_output",
-					"content": {"text": "fallback text"}
-				}
-			}`,
-			want: "fallback text",
-		},
 	}
 
 	for _, tt := range tests {
@@ -141,6 +130,141 @@ func TestMapSessionUpdate_FallbackTextExtraction(t *testing.T) {
 			}
 			if evs[0].Content != tt.want {
 				t.Fatalf("content = %q, want %q", evs[0].Content, tt.want)
+			}
+		})
+	}
+}
+
+func TestMapSessionUpdate_ThinkingAndUnknownDoNotLeakAsText(t *testing.T) {
+	thinkingCases := []struct {
+		name   string
+		params string
+		want   string
+	}{
+		{
+			name: "agent_message_chunk with thinking content.type",
+			params: `{
+				"sessionId": "s1",
+				"update": {
+					"sessionUpdate": "agent_message_chunk",
+					"content": {"type": "thinking", "text": "internal thought"}
+				}
+			}`,
+			want: "internal thought",
+		},
+		{
+			name: "agent_message_chunk with thought content.type",
+			params: `{
+				"sessionId": "s1",
+				"update": {
+					"sessionUpdate": "agent_message_chunk",
+					"content": {"type": "thought", "text": "step by step"}
+				}
+			}`,
+			want: "step by step",
+		},
+		{
+			name: "agent_message_chunk with reasoning content.type",
+			params: `{
+				"sessionId": "s1",
+				"update": {
+					"sessionUpdate": "agent_message_chunk",
+					"content": {"type": "reasoning", "text": "evaluating"}
+				}
+			}`,
+			want: "evaluating",
+		},
+		{
+			name: "vendor thought_chunk with string content",
+			params: `{
+				"sessionId": "s1",
+				"update": {
+					"sessionUpdate": "thought_chunk",
+					"content": "string thought"
+				}
+			}`,
+			want: "string thought",
+		},
+		{
+			name: "vendor agent_reasoning_chunk",
+			params: `{
+				"sessionId": "s1",
+				"update": {
+					"sessionUpdate": "agent_reasoning_chunk",
+					"text": "reasoning delta"
+				}
+			}`,
+			want: "reasoning delta",
+		},
+		{
+			name: "message_chunk with thinking content.type",
+			params: `{
+				"sessionId": "s1",
+				"update": {
+					"sessionUpdate": "message_chunk",
+					"content": {"type": "thinking", "text": "hidden"}
+				}
+			}`,
+			want: "hidden",
+		},
+	}
+
+	for _, tt := range thinkingCases {
+		t.Run(tt.name, func(t *testing.T) {
+			evs := mapSessionUpdate("", json.RawMessage(tt.params))
+			if len(evs) != 1 {
+				t.Fatalf("expected 1 event, got %d: %+v", len(evs), evs)
+			}
+			if evs[0].Type != core.EventThinking {
+				t.Fatalf("expected EventThinking, got %v", evs[0].Type)
+			}
+			if evs[0].Content != tt.want {
+				t.Fatalf("content = %q, want %q", evs[0].Content, tt.want)
+			}
+		})
+	}
+
+	ignoredCases := []struct {
+		name   string
+		params string
+	}{
+		{
+			name: "unknown kind with content.text must not leak as EventText",
+			params: `{
+				"sessionId": "s1",
+				"update": {
+					"sessionUpdate": "custom_output",
+					"content": {"text": "internal diagnostic"}
+				}
+			}`,
+		},
+		{
+			name: "unknown internal status with message",
+			params: `{
+				"sessionId": "s1",
+				"update": {
+					"sessionUpdate": "internal_status",
+					"message": "debug trace"
+				}
+			}`,
+		},
+		{
+			name: "agent_message_chunk empty thinking block",
+			params: `{
+				"sessionId": "s1",
+				"update": {
+					"sessionUpdate": "agent_message_chunk",
+					"content": {"type": "thinking", "text": ""}
+				}
+			}`,
+		},
+	}
+
+	for _, tt := range ignoredCases {
+		t.Run(tt.name, func(t *testing.T) {
+			evs := mapSessionUpdate("", json.RawMessage(tt.params))
+			if len(evs) != 0 {
+				t.Fatalf("expected 0 events, got %+v", evs)
 			}
 		})
 	}

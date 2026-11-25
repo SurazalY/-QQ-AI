@@ -154,6 +154,15 @@ func (as *antigravitySession) Send(prompt string, messageID string, images []cor
 		slog.Warn("antigravitySession: model is configured but ignored because agy does not support --model yet", "model", as.model)
 	}
 
+	env := os.Environ()
+	if len(as.extraEnv) > 0 {
+		env = core.MergeEnv(env, as.extraEnv)
+	}
+	if as.permissionBridge != nil {
+		env = core.MergeEnv(env, as.permissionBridge.Env())
+	}
+	cmdEnv := core.MergeSystemProxyEnv(env)
+
 	var ctx context.Context
 	var cancel context.CancelFunc
 	if as.timeout > 0 {
@@ -173,17 +182,13 @@ func (as *antigravitySession) Send(prompt string, messageID string, images []cor
 	cmd := exec.CommandContext(ctx, as.cmd, args...)
 	cmd.WaitDelay = 1 * time.Second
 	cmd.Dir = as.workDir
-	env := os.Environ()
-	if len(as.extraEnv) > 0 {
-		env = core.MergeEnv(env, as.extraEnv)
-	}
-	if as.permissionBridge != nil {
-		env = core.MergeEnv(env, as.permissionBridge.Env())
-	}
-	cmd.Env = env
+	cmd.Env = cmdEnv
+	detachControllingTTY(cmd)
 
-	// Keep stdin disconnected: agy --print consumes piped stdin to EOF before
-	// processing the prompt, so an open pipe would deadlock the turn.
+	// Provide an immediate-EOF pipe (not /dev/null, which has ModeCharDevice)
+	// so `agy -p` neither deadlocks waiting on stdin EOF nor treats stdin as a
+	// controlling terminal for interactive browser OAuth prompts.
+	cmd.Stdin = strings.NewReader("")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("antigravitySession: stdout pipe: %w", err)

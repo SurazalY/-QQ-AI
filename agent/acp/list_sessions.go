@@ -64,14 +64,36 @@ type acpSessionListEntry struct {
 	UpdatedAt string `json:"updatedAt,omitempty"`
 }
 
+// probeSpawnEnv builds the environment slice for list-session probe subprocesses.
+// It preserves sessionEnv (e.g. PATH/CC_*), gives static config extraEnv precedence
+// without duplicate keys, fills system proxy vars when unset, and never injects
+// SSH_CONNECTION.
+func (a *Agent) probeSpawnEnv(baseEnv []string) []string {
+	a.mu.RLock()
+	extraEnv := append([]string(nil), a.extraEnv...)
+	sessionEnv := append([]string(nil), a.sessionEnv...)
+	a.mu.RUnlock()
+
+	env := core.MergeEnv(baseEnv, sessionEnv)
+	env = core.MergeEnv(env, extraEnv)
+	return core.MergeSystemProxyEnv(env)
+}
+
 // probeSpawn launches `<cmd> <args...>`, sets up a JSON-RPC transport
 // and starts its readLoop. The caller owns the returned `teardown`
 // func and must invoke it to reap the child process.
 func (a *Agent) probeSpawn(ctx context.Context, cwd string) (*transport, *bytes.Buffer, func(), error) {
+	a.mu.RLock()
+	cmdPath := a.cmd
 	allArgs := append(append([]string{}, a.cliExtraArgs...), a.args...)
-	cmd := exec.CommandContext(ctx, a.cmd, allArgs...)
+	a.mu.RUnlock()
+
+	cmd := exec.CommandContext(ctx, cmdPath, allArgs...)
 	cmd.Dir = cwd
-	cmd.Env = core.MergeEnv(os.Environ(), a.extraEnv)
+	cmd.Env = a.probeSpawnEnv(os.Environ())
+	if isAgyCommand(cmdPath) {
+		detachControllingTTY(cmd)
+	}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

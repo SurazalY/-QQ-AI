@@ -63,8 +63,32 @@ type Agent struct {
 
 	activeSession atomic.Pointer[acpSession]
 
+	errorSinkMu sync.RWMutex
+	errorSink   core.MonitorErrorSink
+
+	// probeRunner is an optional test seam for ProbeMonitor command execution.
+	probeRunner func(ctx context.Context, cmd string, args []string, dir string, env []string) ([]byte, error)
+
 	mu sync.RWMutex
 }
+
+// SetMonitorErrorSink implements core.MonitorErrorReporter.
+func (a *Agent) SetMonitorErrorSink(sink core.MonitorErrorSink) {
+	a.errorSinkMu.Lock()
+	a.errorSink = sink
+	a.errorSinkMu.Unlock()
+	if sess := a.activeSession.Load(); sess != nil {
+		sess.setErrorSink(sink)
+	}
+}
+
+func (a *Agent) getErrorSink() core.MonitorErrorSink {
+	a.errorSinkMu.RLock()
+	defer a.errorSinkMu.RUnlock()
+	return a.errorSink
+}
+
+var _ core.MonitorErrorReporter = (*Agent)(nil)
 
 // sessionCallbacks lets a running acpSession report what it learned
 // during the handshake back to its parent Agent. The session is owned
@@ -261,7 +285,10 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	pendingModel := a.modelOverride
 	a.modelsMu.RUnlock()
 
-	return newACPSession(ctx, acpSessionConfig{
+	sessionKey := extractEnvValue(extra, "CC_SESSION_KEY")
+	sink := a.getErrorSink()
+
+	sess, err := newACPSession(ctx, acpSessionConfig{
 		command:             command,
 		args:                allArgs,
 		extraEnv:            extra,
@@ -272,7 +299,33 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 		initialModel:        pendingModel,
 		callbacks:           a,
 		autoApproveCommands: a.autoApproveCommands,
+		sessionKey:          sessionKey,
+		errorSink:           sink,
 	})
+	if err != nil {
+		if sink != nil {
+			sink.RecordMonitorError(core.MonitorErrorEntry{
+				Source:     "acp_process",
+				Level:      "error",
+				SessionKey: sessionKey,
+				Code:       "START_FAILED",
+				Summary:    fmt.Sprintf("acp start session failed (%s)", filepath.Base(command)),
+				Detail:     err.Error(),
+			})
+		}
+		return nil, err
+	}
+	return sess, nil
+}
+
+func extractEnvValue(pairs []string, key string) string {
+	prefix := key + "="
+	for i := len(pairs) - 1; i >= 0; i-- {
+		if strings.HasPrefix(pairs[i], prefix) {
+			return strings.TrimPrefix(pairs[i], prefix)
+		}
+	}
+	return ""
 }
 
 func (a *Agent) Stop() error { return nil }

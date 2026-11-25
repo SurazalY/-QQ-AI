@@ -447,5 +447,85 @@
     "light": "浅色",
     "dark": "深色",
     "system": "跟随系统"
+  },
+  "monitor": {
+    "title": "持续运行监控",
+    "autoRefresh": "自动刷新: 10s",
+    "autoRefreshPaused": "已暂停",
+    "lastUpdated": "更新于 {{time}}",
+    "status": {
+      "healthy": "健康",
+      "degraded": "降级",
+      "unhealthy": "异常",
+      "unknown": "未知"
+    },
+    "health": {
+      "title": "{{name}} 连通健康性",
+      "probeNow": "立即探测",
+      "probing": "探测中...",
+      "cliVersion": "CLI 版本",
+      "activeModel": "当前活跃模型",
+      "aliveSessions": "ACP 存活会话",
+      "lastProbe": "最近探测",
+      "latency": "探测延迟",
+      "failures": "连续失败",
+      "nextProbe": "下次自动探测",
+      "neverProbed": "尚未探测",
+      "platforms": "平台连接状态",
+      "noPlatforms": "未配置平台",
+      "noAgents": "未配置 Agent",
+      "connected": "已连接",
+      "disconnected": "未连接",
+      "degradedSince": "降级始于 {{time}}",
+      "activeSessionsList": "活跃 ACP 会话",
+      "alive": "存活",
+      "dead": "已退出"
+    },
+    "quota": {
+      "title": "{{name}} 剩余额度",
+      "activeGroup": "当前模型",
+      "credits": "Credits: {{count}}",
+      "upgrade": "升级",
+      "resetsIn": "{{time}} 后重置",
+      "resetAt": "重置时间 {{time}}",
+      "resetDue": "即将重置",
+      "unavailable": "暂无额度数据",
+      "unavailableHint": "可点击「立即探测」或等待自动探测拉取账号剩余额度。",
+      "fetchedAt": "拉取于 {{time}}"
+    },
+    "errors": {
+      "title": "近期报错",
+      "recent15m": "15 分钟内",
+      "recent1h": "1 小时内",
+      "totalRetained": "总保留",
+      "clear": "清空",
+      "clearConfirmTitle": "清空报错记录",
+      "clearConfirmDesc": "确定要清空全部 {{count}} 条报错记录吗？这也会清空本地持久化日志文件。",
+      "empty": "暂无报错记录",
+      "emptyFiltered": "当前筛选条件下无报错记录",
+      "allSources": "全部",
+      "source": {
+        "agy_stream": "agy 流报错",
+        "acp_process": "ACP 进程",
+        "engine": "Engine",
+        "platform": "平台",
+        "probe": "探测"
+      },
+      "allLevels": "全部级别",
+      "level": {
+        "error": "错误",
+        "warn": "警告"
+      },
+      "showDetail": "详情",
+      "hideDetail": "收起"
+    },
+    "time": {
+      "now": "刚刚",
+      "secondsAgo": "{{count}} 秒前",
+      "minutesAgo": "{{count}} 分钟前",
+      "hoursAgo": "{{count}} 小时前",
+      "daysAgo": "{{count}} 天前",
+      "dueNow": "即将执行"
+    }
   }
 }

@@ -9,6 +9,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,10 +46,88 @@ type Platform struct {
 	echoSeq               atomic.Int64
 	echoCh                sync.Map // echo -> chan json.RawMessage
 	cancel                context.CancelFunc
-	selfID                int64
+	stopped               bool
+	selfID                atomic.Int64
 	dedup                 core.MessageDedup
 	groupNameCache        sync.Map // groupID -> group name
 	httpURL               string   // OneBot HTTP API URL, e.g. "http://127.0.0.1:3000"
+	reconnectDelay        func(attempt int) time.Duration
+
+	healthMu       sync.RWMutex
+	connected      bool
+	degraded       bool
+	degradedReason string
+	degradedSince  time.Time
+	errorSink      core.MonitorErrorSink
+}
+
+const (
+	qqMaxFastReconnectAttempts  = 30
+	qqDefaultSlowReconnectDelay = 60 * time.Second
+)
+
+var urlQuerySecretRe = regexp.MustCompile(`(?i)([?&](?:access_token|token|secret|api_key|apikey|auth)=)([^&\s"'<>` + "`" + `]+)`)
+
+func extractURLQuerySecrets(rawURL string) []string {
+	if rawURL == "" {
+		return nil
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil
+	}
+	sensitiveKeys := map[string]bool{
+		"access_token": true,
+		"token":        true,
+		"secret":       true,
+		"api_key":      true,
+		"apikey":       true,
+		"auth":         true,
+	}
+	var secrets []string
+	for k, vals := range u.Query() {
+		if !sensitiveKeys[strings.ToLower(k)] {
+			continue
+		}
+		for _, v := range vals {
+			if v != "" {
+				secrets = append(secrets, v)
+			}
+		}
+	}
+	for _, part := range strings.Split(u.RawQuery, "&") {
+		k, v, ok := strings.Cut(part, "=")
+		if !ok || v == "" {
+			continue
+		}
+		if sensitiveKeys[strings.ToLower(k)] {
+			secrets = append(secrets, v)
+		}
+	}
+	return secrets
+}
+
+func (p *Platform) redactSecrets(text string) string {
+	if text == "" {
+		return text
+	}
+	var secrets []string
+	for _, s := range []string{p.token, p.httpToken} {
+		if s != "" {
+			secrets = append(secrets, s)
+		}
+	}
+	secrets = append(secrets, extractURLQuerySecrets(p.wsURL)...)
+	secrets = append(secrets, extractURLQuerySecrets(p.httpURL)...)
+
+	// Redact longest secrets first so shorter substrings do not leave partial fragments.
+	sort.Slice(secrets, func(i, j int) bool {
+		return len(secrets[i]) > len(secrets[j])
+	})
+	for _, s := range secrets {
+		text = core.RedactToken(text, s)
+	}
+	return urlQuerySecretRe.ReplaceAllString(text, "${1}[REDACTED]")
 }
 
 func New(opts map[string]any) (core.Platform, error) {
@@ -104,6 +185,72 @@ func New(opts map[string]any) (core.Platform, error) {
 
 func (p *Platform) Name() string { return "qq" }
 
+// SetMonitorErrorSink implements core.MonitorErrorReporter.
+func (p *Platform) SetMonitorErrorSink(sink core.MonitorErrorSink) {
+	p.healthMu.Lock()
+	p.errorSink = sink
+	p.healthMu.Unlock()
+}
+
+var _ core.MonitorErrorReporter = (*Platform)(nil)
+
+// PlatformHealth implements core.PlatformHealth.
+func (p *Platform) PlatformHealth() core.PlatformHealthInfo {
+	p.healthMu.RLock()
+	defer p.healthMu.RUnlock()
+	return core.PlatformHealthInfo{
+		Name:           p.Name(),
+		Connected:      p.connected,
+		Degraded:       p.degraded,
+		DegradedReason: p.degradedReason,
+		DegradedSince:  p.degradedSince,
+	}
+}
+
+var _ core.PlatformHealth = (*Platform)(nil)
+
+func (p *Platform) setConnected() {
+	p.healthMu.Lock()
+	p.connected = true
+	p.degraded = false
+	p.degradedReason = ""
+	p.degradedSince = time.Time{}
+	p.healthMu.Unlock()
+}
+
+func (p *Platform) setDegraded(reason string) {
+	p.healthMu.Lock()
+	p.connected = false
+	p.degraded = true
+	p.degradedReason = reason
+	if p.degradedSince.IsZero() {
+		p.degradedSince = time.Now()
+	}
+	p.healthMu.Unlock()
+}
+
+func (p *Platform) setDisconnected() {
+	p.healthMu.Lock()
+	p.connected = false
+	p.healthMu.Unlock()
+}
+
+func (p *Platform) recordMonitorError(level, code, summary, detail string) {
+	p.healthMu.RLock()
+	sink := p.errorSink
+	p.healthMu.RUnlock()
+	if sink == nil {
+		return
+	}
+	sink.RecordMonitorError(core.MonitorErrorEntry{
+		Source:  "platform",
+		Level:   level,
+		Code:    code,
+		Summary: summary,
+		Detail:  detail,
+	})
+}
+
 func (p *Platform) Start(handler core.MessageHandler) error {
 	p.handler = handler
 
@@ -114,14 +261,26 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 
 	conn, _, err := websocket.DefaultDialer.Dial(p.wsURL, header)
 	if err != nil {
-		return fmt.Errorf("qq: ws connect failed (%s): %w", p.wsURL, err)
+		safeErr := p.redactSecrets(err.Error())
+		safeURL := p.redactSecrets(p.wsURL)
+		p.setDegraded("ws connect failed: " + safeErr)
+		p.recordMonitorError("error", "WS_CONNECT_FAILED", "qq websocket connect failed", safeErr)
+		if safeErr != err.Error() {
+			return fmt.Errorf("qq: ws connect failed (%s): %s", safeURL, safeErr)
+		}
+		return fmt.Errorf("qq: ws connect failed (%s): %w", safeURL, err)
 	}
-	p.conn = conn
-
-	slog.Info("qq: connected to OneBot", "url", p.wsURL)
 
 	ctx, cancel := context.WithCancel(context.Background())
+
+	p.mu.Lock()
+	p.stopped = false
+	p.conn = conn
 	p.cancel = cancel
+	p.setConnected()
+	p.mu.Unlock()
+
+	slog.Info("qq: connected to OneBot", "url", p.redactSecrets(p.wsURL))
 
 	// Start readLoop BEFORE callAPI: callAPI's response is routed by readLoop,
 	// so calling it first would always time out after 15s and leave selfID=0,
@@ -131,13 +290,13 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 
 	// Get bot self info
 	if info, err := p.callAPI("get_login_info", nil); err == nil {
-		if uid, ok := info["user_id"].(float64); ok {
-			p.selfID = int64(uid)
+		if uid := jsonInt64(info, "user_id"); uid != 0 {
+			p.selfID.Store(uid)
 		}
 		nick, _ := info["nickname"].(string)
-		slog.Info("qq: logged in", "qq", p.selfID, "nickname", nick)
+		slog.Info("qq: logged in", "qq", p.selfID.Load(), "nickname", nick)
 	} else {
-		slog.Warn("qq: get_login_info failed; self-message filter disabled until next reconnect", "error", err)
+		slog.Warn("qq: get_login_info failed; self-message filter disabled until next reconnect", "error", p.redactSecrets(err.Error()))
 	}
 
 	return nil
@@ -151,13 +310,43 @@ func (p *Platform) readLoop(ctx context.Context) {
 		default:
 		}
 
-		_, raw, err := p.conn.ReadMessage()
+		p.mu.Lock()
+		if p.stopped {
+			p.mu.Unlock()
+			return
+		}
+		conn := p.conn
+		p.mu.Unlock()
+		if conn == nil {
+			if !p.reconnect(ctx) {
+				return
+			}
+			continue
+		}
+
+		_, raw, err := conn.ReadMessage()
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
-			slog.Error("qq: ws read error, reconnecting...", "error", err)
-			p.reconnect()
+			p.mu.Lock()
+			stopped := p.stopped
+			if p.conn == conn {
+				p.conn = nil
+			}
+			p.mu.Unlock()
+			_ = conn.Close()
+			if stopped || ctx.Err() != nil {
+				return
+			}
+
+			safeErr := p.redactSecrets(err.Error())
+			slog.Error("qq: ws read error, reconnecting...", "error", safeErr)
+			p.setDegraded("websocket disconnected: " + safeErr)
+			p.recordMonitorError("error", "WS_DISCONNECTED", "qq websocket disconnected", safeErr)
+			if !p.reconnect(ctx) {
+				return
+			}
 			continue
 		}
 
@@ -185,25 +374,83 @@ func (p *Platform) readLoop(ctx context.Context) {
 	}
 }
 
-func (p *Platform) reconnect() {
-	for i := 1; i <= 30; i++ {
-		time.Sleep(time.Duration(i) * 2 * time.Second)
+func (p *Platform) nextReconnectDelay(attempt int) time.Duration {
+	if p.reconnectDelay != nil {
+		return p.reconnectDelay(attempt)
+	}
+	if attempt <= qqMaxFastReconnectAttempts {
+		return time.Duration(attempt) * 2 * time.Second
+	}
+	return qqDefaultSlowReconnectDelay
+}
+
+func (p *Platform) reconnect(ctx context.Context) bool {
+	reportedMax := false
+	for i := 1; ; i++ {
+		delay := p.nextReconnectDelay(i)
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return false
+			case <-timer.C:
+			}
+		}
+		if ctx.Err() != nil {
+			return false
+		}
+		p.mu.Lock()
+		stopped := p.stopped
+		p.mu.Unlock()
+		if stopped {
+			return false
+		}
+
 		header := http.Header{}
 		if p.token != "" {
 			header.Set("Authorization", "Bearer "+p.token)
 		}
-		conn, _, err := websocket.DefaultDialer.Dial(p.wsURL, header)
+		conn, _, err := websocket.DefaultDialer.DialContext(ctx, p.wsURL, header)
 		if err != nil {
-			slog.Warn("qq: reconnect attempt failed", "attempt", i, "error", err)
+			if ctx.Err() != nil {
+				return false
+			}
+			safeErr := p.redactSecrets(err.Error())
+			if i <= qqMaxFastReconnectAttempts {
+				slog.Warn("qq: reconnect attempt failed", "attempt", i, "error", safeErr)
+				if i == qqMaxFastReconnectAttempts && !reportedMax {
+					reportedMax = true
+					detail := safeErr
+					if detail == "" {
+						detail = "max reconnect attempts reached"
+					}
+					p.setDegraded("websocket reconnect failed after 30 attempts: " + detail)
+					p.recordMonitorError("error", "WS_RECONNECT_FAILED", "qq websocket reconnect failed after 30 attempts", detail)
+					slog.Error("qq: failed to reconnect after 30 attempts, continuing slow retry", "error", detail)
+				}
+			} else {
+				slog.Debug("qq: slow reconnect attempt failed", "attempt", i, "error", safeErr)
+			}
 			continue
 		}
+
 		p.mu.Lock()
+		if p.stopped || ctx.Err() != nil {
+			p.mu.Unlock()
+			_ = conn.Close()
+			return false
+		}
+		oldConn := p.conn
 		p.conn = conn
+		p.setConnected()
 		p.mu.Unlock()
-		slog.Info("qq: reconnected")
-		return
+		if oldConn != nil && oldConn != conn {
+			_ = oldConn.Close()
+		}
+		slog.Info("qq: reconnected", "attempt", i)
+		return true
 	}
-	slog.Error("qq: failed to reconnect after 30 attempts")
 }
 
 func (p *Platform) handleMessage(payload map[string]any) {
@@ -218,7 +465,7 @@ func (p *Platform) handleMessage(payload map[string]any) {
 		return
 	}
 
-	if userID == p.selfID {
+	if selfID := p.selfID.Load(); selfID != 0 && userID == selfID {
 		return
 	}
 
@@ -330,8 +577,11 @@ func (p *Platform) parseMessage(payload map[string]any, msgType string, groupID 
 					textParts = append(textParts, text)
 				}
 			case "at":
-				target := data["qq"].(string)
-				if target == strconv.FormatInt(p.selfID, 10) {
+				target := extractQQTarget(data)
+				if target == "" {
+					continue
+				}
+				if selfID := p.selfID.Load(); selfID != 0 && target == strconv.FormatInt(selfID, 10) {
 					textParts = append(textParts, "[QQ：此消息直接 @ 了你] ")
 				} else {
 					textParts = append(textParts, "@"+target+" ")
@@ -498,8 +748,15 @@ func (p *Platform) Reply(ctx context.Context, replyCtx any, content string) erro
 
 // Send sends a message to the conversation identified by replyCtx.
 func (p *Platform) Send(ctx context.Context, replyCtx any, content string) error {
-	content = strings.TrimSpace(content)
-	if content == "" || content == "[SILENT]" {
+	cleaned, isSilent, leakedCoT := core.SanitizeSilentReply(content)
+	if isSilent {
+		if leakedCoT {
+			slog.Warn("qq: suppressed leaked chain-of-thought in silent reply", "raw_len", len(content))
+		}
+		return nil
+	}
+	content = strings.TrimSpace(cleaned)
+	if content == "" {
 		return nil
 	}
 	rctx, ok := replyCtx.(*replyContext)
@@ -521,9 +778,12 @@ func (p *Platform) Send(ctx context.Context, replyCtx any, content string) error
 		parts = nil
 		for _, line := range strings.Split(content, "\n") {
 			line = strings.TrimSpace(line)
-			if line != "" && line != "[SILENT]" {
+			if line != "" && !strings.EqualFold(line, "[SILENT]") && !strings.EqualFold(line, "NO_REPLY") {
 				parts = append(parts, line)
 			}
+		}
+		if len(parts) == 0 {
+			return nil
 		}
 		if len(parts) > 3 {
 			parts = parts[:3]
@@ -606,12 +866,29 @@ func (p *Platform) SendImage(ctx context.Context, replyCtx any, img core.ImageAt
 
 var _ core.ImageSender = (*Platform)(nil)
 
-func (p *Platform) Stop() error {
-	if p.cancel != nil {
-		p.cancel()
+func (p *Platform) wrapRedactedError(prefix string, err error) error {
+	safeErr := p.redactSecrets(err.Error())
+	if safeErr != err.Error() {
+		return fmt.Errorf("%s: %s", prefix, safeErr)
 	}
-	if p.conn != nil {
-		return p.conn.Close()
+	return fmt.Errorf("%s: %w", prefix, err)
+}
+
+func (p *Platform) Stop() error {
+	p.mu.Lock()
+	p.stopped = true
+	cancel := p.cancel
+	p.cancel = nil
+	conn := p.conn
+	p.conn = nil
+	p.setDisconnected()
+	p.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if conn != nil {
+		return conn.Close()
 	}
 	return nil
 }
@@ -622,11 +899,13 @@ func (p *Platform) resolveGroupName(groupID int64) string {
 	}
 	fallback := strconv.FormatInt(groupID, 10)
 	if cached, ok := p.groupNameCache.Load(fallback); ok {
-		return cached.(string)
+		if name, ok := cached.(string); ok {
+			return name
+		}
 	}
 	result, err := p.callAPI("get_group_info", map[string]any{"group_id": groupID})
 	if err != nil {
-		slog.Debug("qq: resolve group name failed", "group_id", groupID, "error", err)
+		slog.Debug("qq: resolve group name failed", "group_id", groupID, "error", p.redactSecrets(err.Error()))
 		return fallback
 	}
 	name, _ := result["group_name"].(string)
@@ -641,12 +920,16 @@ func (p *Platform) resolveGroupName(groupID int64) string {
 
 func (p *Platform) callAPI(action string, params map[string]any) (result map[string]any, apiErr error) {
 	defer func() {
-		if apiErr != nil && action == "send_group_msg" && p.errorUserID != 0 {
-			if _, err := p.callAPI("send_private_msg", map[string]any{
-				"user_id": p.errorUserID,
-				"message": fmt.Sprintf("群 %v 发送失败：\n%v", params["group_id"], apiErr),
-			}); err != nil {
-				slog.Error("qq: error notification failed", "error", err)
+		if apiErr != nil {
+			safeErr := p.redactSecrets(apiErr.Error())
+			p.recordMonitorError("error", "PLATFORM_ERROR", fmt.Sprintf("qq API %s failed", action), safeErr)
+			if action == "send_group_msg" && p.errorUserID != 0 {
+				if _, err := p.callAPI("send_private_msg", map[string]any{
+					"user_id": p.errorUserID,
+					"message": fmt.Sprintf("群 %v 发送失败：\n%s", params["group_id"], safeErr),
+				}); err != nil {
+					slog.Error("qq: error notification failed", "error", p.redactSecrets(err.Error()))
+				}
 			}
 		}
 	}()
@@ -671,10 +954,15 @@ func (p *Platform) callAPI(action string, params map[string]any) (result map[str
 	}
 
 	p.mu.Lock()
-	err = p.conn.WriteMessage(websocket.TextMessage, data)
+	conn := p.conn
+	if conn == nil {
+		p.mu.Unlock()
+		return nil, fmt.Errorf("qq: ws not connected")
+	}
+	err = conn.WriteMessage(websocket.TextMessage, data)
 	p.mu.Unlock()
 	if err != nil {
-		return nil, fmt.Errorf("qq: ws write: %w", err)
+		return nil, p.wrapRedactedError("qq: ws write", err)
 	}
 
 	select {
@@ -705,12 +993,16 @@ func (p *Platform) callAPI(action string, params map[string]any) (result map[str
 // Requires http_url to be configured.
 func (p *Platform) callHTTPAPI(action string, params map[string]any) (result map[string]any, apiErr error) {
 	defer func() {
-		if apiErr != nil && action == "upload_group_file" && p.errorUserID != 0 {
-			if _, err := p.callAPI("send_private_msg", map[string]any{
-				"user_id": p.errorUserID,
-				"message": fmt.Sprintf("群 %v 文件发送失败：\n%v", params["group_id"], apiErr),
-			}); err != nil {
-				slog.Error("qq: error notification failed", "error", err)
+		if apiErr != nil {
+			safeErr := p.redactSecrets(apiErr.Error())
+			p.recordMonitorError("error", "PLATFORM_ERROR", fmt.Sprintf("qq HTTP %s failed", action), safeErr)
+			if action == "upload_group_file" && p.errorUserID != 0 {
+				if _, err := p.callAPI("send_private_msg", map[string]any{
+					"user_id": p.errorUserID,
+					"message": fmt.Sprintf("群 %v 文件发送失败：\n%s", params["group_id"], safeErr),
+				}); err != nil {
+					slog.Error("qq: error notification failed", "error", p.redactSecrets(err.Error()))
+				}
 			}
 		}
 	}()
@@ -724,7 +1016,7 @@ func (p *Platform) callHTTPAPI(action string, params map[string]any) (result map
 	url := p.httpURL + "/" + action
 	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return nil, p.wrapRedactedError(fmt.Sprintf("qq: HTTP %s request", action), err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if p.httpToken != "" {
@@ -733,13 +1025,13 @@ func (p *Platform) callHTTPAPI(action string, params map[string]any) (result map
 	client := &http.Client{Timeout: 120 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("qq: HTTP %s failed: %w", action, err)
+		return nil, p.wrapRedactedError(fmt.Sprintf("qq: HTTP %s failed", action), err)
 	}
 	defer resp.Body.Close()
 
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("qq: HTTP %s read body: %w", action, err)
+		return nil, p.wrapRedactedError(fmt.Sprintf("qq: HTTP %s read body", action), err)
 	}
 
 	var apiResp struct {
@@ -752,7 +1044,7 @@ func (p *Platform) callHTTPAPI(action string, params map[string]any) (result map
 		return nil, fmt.Errorf("qq: HTTP %s invalid response", action)
 	}
 	if apiResp.RetCode != 0 {
-		return nil, fmt.Errorf("qq: HTTP %s failed (retcode=%d, msg=%s)", action, apiResp.RetCode, apiResp.Message)
+		return nil, fmt.Errorf("qq: HTTP %s failed (retcode=%d, msg=%s)", action, apiResp.RetCode, p.redactSecrets(apiResp.Message))
 	}
 	_ = json.Unmarshal(apiResp.Data, &result)
 	return result, nil
@@ -799,14 +1091,36 @@ func (p *Platform) isAllowed(userID int64) bool {
 	return false
 }
 
+// extractQQTarget safely converts a OneBot "at" segment's data["qq"] field to string.
+func extractQQTarget(data map[string]any) string {
+	if data == nil {
+		return ""
+	}
+	switch v := data["qq"].(type) {
+	case string:
+		return v
+	case float64:
+		return strconv.FormatInt(int64(v), 10)
+	case json.Number:
+		return v.String()
+	case int64:
+		return strconv.FormatInt(v, 10)
+	case int:
+		return strconv.Itoa(v)
+	default:
+		return ""
+	}
+}
+
 // messageMentionsSelf reports whether a OneBot message payload @-mentions the
 // bot itself (or @all). Used to gate group messages when require_mention is on.
 // It fails open (returns true) when the bot's own id is unknown.
 func (p *Platform) messageMentionsSelf(payload map[string]any) bool {
-	if p.selfID == 0 {
+	selfID := p.selfID.Load()
+	if selfID == 0 {
 		return true
 	}
-	self := strconv.FormatInt(p.selfID, 10)
+	self := strconv.FormatInt(selfID, 10)
 	switch m := payload["message"].(type) {
 	case []any:
 		for _, seg := range m {
@@ -818,13 +1132,7 @@ func (p *Platform) messageMentionsSelf(payload map[string]any) bool {
 				continue
 			}
 			data, _ := segMap["data"].(map[string]any)
-			var q string
-			switch v := data["qq"].(type) {
-			case string:
-				q = v
-			case float64:
-				q = strconv.FormatInt(int64(v), 10)
-			}
+			q := extractQQTarget(data)
 			if q == self || q == "all" {
 				return true
 			}

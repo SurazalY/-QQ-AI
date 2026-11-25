@@ -1025,6 +1025,13 @@ func main() {
 		engines[i].SetHeartbeatScheduler(heartbeatSched)
 	}
 
+	// Initialize persistent monitoring store and error sinks before engines start.
+	monitorStore := core.NewMonitorStore(cfg.DataDir)
+	for i, proj := range cfg.Projects {
+		monitorStore.RegisterEngine(proj.Name, engines[i])
+		engines[i].SetMonitorStore(monitorStore)
+	}
+
 	var startErrors []error
 	for _, e := range engines {
 		if err := e.Start(); err != nil {
@@ -1082,6 +1089,10 @@ func main() {
 		bridgeSrv.Start()
 	}
 
+	// Start monitorStore after all platforms (including bridge) are attached to
+	// engines so background probes never race with AddPlatform.
+	monitorStore.Start()
+
 	// Start webhook server if enabled
 	var webhookSrv *core.WebhookServer
 	if cfg.Webhook.Enabled != nil && *cfg.Webhook.Enabled {
@@ -1108,6 +1119,7 @@ func main() {
 			port = 9820
 		}
 		mgmtSrv = core.NewManagementServer(port, cfg.Management.Token, cfg.Management.CORSOrigins)
+		mgmtSrv.SetMonitorStore(monitorStore)
 		for i, e := range engines {
 			mgmtSrv.RegisterEngine(cfg.Projects[i].Name, e)
 		}
@@ -1337,6 +1349,7 @@ func main() {
 	}
 
 	slog.Info("shutting down...")
+	monitorStore.Stop()
 	if mgmtSrv != nil {
 		mgmtSrv.Stop()
 	}

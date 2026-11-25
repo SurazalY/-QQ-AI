@@ -447,5 +447,85 @@
     "light": "Light",
     "dark": "Dark",
     "system": "System"
+  },
+  "monitor": {
+    "title": "Service Monitor",
+    "autoRefresh": "Auto-refresh: 10s",
+    "autoRefreshPaused": "Paused",
+    "lastUpdated": "Updated {{time}}",
+    "status": {
+      "healthy": "Healthy",
+      "degraded": "Degraded",
+      "unhealthy": "Unhealthy",
+      "unknown": "Unknown"
+    },
+    "health": {
+      "title": "{{name}} Connectivity & Health",
+      "probeNow": "Probe Now",
+      "probing": "Probing...",
+      "cliVersion": "CLI Version",
+      "activeModel": "Active Model",
+      "aliveSessions": "ACP Alive Sessions",
+      "lastProbe": "Last Probe",
+      "latency": "Latency",
+      "failures": "Consecutive Failures",
+      "nextProbe": "Next Auto Probe",
+      "neverProbed": "Not probed yet",
+      "platforms": "Platform Connections",
+      "noPlatforms": "No platforms configured",
+      "noAgents": "No agents configured",
+      "connected": "Connected",
+      "disconnected": "Disconnected",
+      "degradedSince": "Degraded since {{time}}",
+      "activeSessionsList": "Active ACP Sessions",
+      "alive": "alive",
+      "dead": "exited"
+    },
+    "quota": {
+      "title": "{{name}} Remaining Quota & Credits",
+      "activeGroup": "Active Model",
+      "credits": "Credits: {{count}}",
+      "upgrade": "Upgrade",
+      "resetsIn": "Resets in {{time}}",
+      "resetAt": "Resets at {{time}}",
+      "resetDue": "Resetting soon",
+      "unavailable": "Quota data unavailable",
+      "unavailableHint": "Click \"Probe Now\" or wait for the automatic probe to fetch account usage.",
+      "fetchedAt": "Fetched {{time}}"
+    },
+    "errors": {
+      "title": "Recent Errors",
+      "recent15m": "15m",
+      "recent1h": "1h",
+      "totalRetained": "Retained",
+      "clear": "Clear",
+      "clearConfirmTitle": "Clear Error History",
+      "clearConfirmDesc": "Are you sure you want to clear all {{count}} retained error entries? This will also truncate the persisted errors log.",
+      "empty": "No recent errors",
+      "emptyFiltered": "No errors match the current filters",
+      "allSources": "All",
+      "source": {
+        "agy_stream": "agy Stream",
+        "acp_process": "ACP Process",
+        "engine": "Engine",
+        "platform": "Platform",
+        "probe": "Probe"
+      },
+      "allLevels": "All Levels",
+      "level": {
+        "error": "Error",
+        "warn": "Warn"
+      },
+      "showDetail": "Detail",
+      "hideDetail": "Hide"
+    },
+    "time": {
+      "now": "just now",
+      "secondsAgo": "{{count}}s ago",
+      "minutesAgo": "{{count}}m ago",
+      "hoursAgo": "{{count}}h ago",
+      "daysAgo": "{{count}}d ago",
+      "dueNow": "Due now"
+    }
   }
 }

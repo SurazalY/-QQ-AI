@@ -53,6 +53,49 @@ func mapSessionUpdate(sessionID string, params json.RawMessage) []core.Event {
 	}
 }
 
+func isThinkingKind(s string) bool {
+	lower := strings.ToLower(strings.TrimSpace(s))
+	return strings.Contains(lower, "thought") ||
+		strings.Contains(lower, "thinking") ||
+		strings.Contains(lower, "reasoning")
+}
+
+func extractUpdateContent(update json.RawMessage) (contentType string, text string) {
+	var obj struct {
+		Content struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if json.Unmarshal(update, &obj) == nil {
+		contentType = obj.Content.Type
+		if obj.Content.Text != "" {
+			return contentType, obj.Content.Text
+		}
+	}
+
+	var strContent struct {
+		Content string `json:"content"`
+	}
+	if json.Unmarshal(update, &strContent) == nil && strContent.Content != "" {
+		return contentType, strContent.Content
+	}
+
+	var flat struct {
+		Text    string `json:"text"`
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(update, &flat) == nil {
+		if flat.Text != "" {
+			return contentType, flat.Text
+		}
+		if flat.Message != "" {
+			return contentType, flat.Message
+		}
+	}
+	return contentType, ""
+}
+
 // mapAgentMessageChunk handles agent_message_chunk and user_message_chunk updates.
 // It supports multiple JSON formats for broader vendor compatibility:
 // - Standard ACP: {"content": {"type": "text", "text": "..."}}
@@ -67,12 +110,24 @@ func mapAgentMessageChunk(sessionID string, update json.RawMessage) []core.Event
 			Text string `json:"text"`
 		} `json:"content"`
 	}
-	if err := json.Unmarshal(update, &u); err == nil && u.Content.Text != "" {
-		return []core.Event{{
-			Type:      core.EventText,
-			Content:   u.Content.Text,
-			SessionID: sessionID,
-		}}
+	if err := json.Unmarshal(update, &u); err == nil {
+		if isThinkingKind(u.Content.Type) {
+			if u.Content.Text == "" {
+				return nil
+			}
+			return []core.Event{{
+				Type:      core.EventThinking,
+				Content:   u.Content.Text,
+				SessionID: sessionID,
+			}}
+		}
+		if u.Content.Text != "" {
+			return []core.Event{{
+				Type:      core.EventText,
+				Content:   u.Content.Text,
+				SessionID: sessionID,
+			}}
+		}
 	}
 
 	// Try alternative format: content.text without type field
@@ -227,26 +282,12 @@ func extractToolCallContentText(blocks []struct {
 	return b.String()
 }
 
-// mapSessionUpdateFallback handles unknown sessionUpdate values (vendor extensions
-// that still carry human-readable text). Never guesses auth or tool semantics.
+// mapSessionUpdateFallback handles known vendor sessionUpdate extensions.
+// Reasoning/thinking kinds always route to EventThinking; unknown kinds are
+// ignored rather than leaked into visible chat text.
 func mapSessionUpdateFallback(sessionID string, kind string, update json.RawMessage) []core.Event {
-	// Some agents may send reasoning as a dedicated discriminator; map to EventThinking.
-	switch strings.ToLower(kind) {
-	case "reasoning", "reasoning_chunk", "thinking", "agent_thinking_chunk", "agent_thought_chunk":
-		var u struct {
-			Content struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			} `json:"content"`
-			Text string `json:"text"`
-		}
-		if json.Unmarshal(update, &u) != nil {
-			return nil
-		}
-		t := u.Content.Text
-		if t == "" {
-			t = u.Text
-		}
+	if isThinkingKind(kind) {
+		_, t := extractUpdateContent(update)
 		if t == "" {
 			return nil
 		}
@@ -255,63 +296,30 @@ func mapSessionUpdateFallback(sessionID string, kind string, update json.RawMess
 			Content:   t,
 			SessionID: sessionID,
 		}}
+	}
+
+	switch strings.ToLower(strings.TrimSpace(kind)) {
 	case "message", "message_chunk", "text", "response":
 		// Common vendor extensions for text output
-		var u struct {
-			Content struct {
-				Text string `json:"text"`
-			} `json:"content"`
-			Text    string `json:"text"`
-			Message string `json:"message"`
-		}
-		if json.Unmarshal(update, &u) != nil {
-			return nil
-		}
-		t := u.Content.Text
-		if t == "" {
-			t = u.Text
-		}
-		if t == "" {
-			t = u.Message
-		}
+		contentType, t := extractUpdateContent(update)
 		if t == "" {
 			return nil
+		}
+		evType := core.EventText
+		if isThinkingKind(contentType) {
+			evType = core.EventThinking
 		}
 		return []core.Event{{
-			Type:      core.EventText,
+			Type:      evType,
 			Content:   t,
 			SessionID: sessionID,
 		}}
 	default:
-		// Last resort: try to extract any text-like field from the JSON
-		var generic struct {
-			Content struct {
-				Text string `json:"text"`
-			} `json:"content"`
-			Text    string `json:"text"`
-			Message string `json:"message"`
-		}
-		if err := json.Unmarshal(update, &generic); err != nil {
-			return nil
-		}
-		t := generic.Content.Text
-		if t == "" {
-			t = generic.Text
-		}
-		if t == "" {
-			t = generic.Message
-		}
-		if t != "" {
-			slog.Debug("acp: mapSessionUpdateFallback: extracted text from unknown format", "kind", kind, "text_len", len(t))
-			return []core.Event{{
-				Type:      core.EventText,
-				Content:   t,
-				SessionID: sessionID,
-			}}
-		}
+		// Do not guess unknown update shapes into visible EventText; future vendor
+		// status/internal/thinking updates could otherwise leak into chat.
+		slog.Debug("acp: mapSessionUpdateFallback: ignoring unrecognized update kind", "kind", kind, "update", string(update))
+		return nil
 	}
-	slog.Debug("acp: mapSessionUpdateFallback: unrecognized format", "kind", kind, "update", string(update))
-	return nil
 }
 
 func mapPlan(sessionID string, update json.RawMessage) []core.Event {
