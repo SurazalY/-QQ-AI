@@ -1,0 +1,222 @@
+# ============================================================================
+# 小鲸鱼 QQ AI 机器人生产配置模板（已脱敏）
+# 使用方式：cp config.whale.example.toml config.toml && chmod 600 config.toml
+# 请将所有 <REPLACE_WITH_...> 与路径替换为新服务器的真实值。
+# 注意：真实的 config.toml 已被 .gitignore 忽略，切勿提交到 Git！
+# ============================================================================
+
+data_dir = "/opt/cc-connect/.cc-data"
+attachment_send = "on"
+language = "zh"
+busy_timeout_mins = 2
+shell = "/bin/bash"
+max_attachment_size_mb = 0
+
+[[projects]]
+  name = "whale-qq"
+  reset_on_idle_mins = 0
+  show_context_indicator = false
+  show_workdir_indicator = false
+  reply_footer = false
+  inject_sender = true
+  admin_from = "839107207"
+
+  [projects.agent]
+    type = "acp"
+
+    [projects.agent.options]
+      args = ["acp", "--sandbox", "--dangerously-skip-permissions", "--log-file", "/dev/null"]
+      cmd = "/usr/local/bin/agy"
+      display_name = "Whale ACP"
+      model = "gemini-4-hydrogen"
+      work_dir = "/opt/cc-connect/whale-workspace"
+
+    [projects.agent.options.env]
+      HTTPS_PROXY = "http://127.0.0.1:7897"
+      HTTP_PROXY = "http://127.0.0.1:7897"
+      NO_PROXY = "localhost,127.0.0.1,::1"
+
+  [[projects.platforms]]
+    type = "qq"
+
+    [projects.platforms.options]
+      allow_from = "*"
+      allow_groups = "706636822,823658226"
+      allow_private = "839107207"
+      error_user_id = "839107207"
+      http_token = "<REPLACE_WITH_ONEBOT_HTTP_TOKEN>"
+      http_url = "http://127.0.0.1:3000"
+      require_mention = false
+      share_session_in_channel = true
+      split_lines = true
+      token = "<REPLACE_WITH_ONEBOT_WS_TOKEN>"
+      ws_url = "ws://127.0.0.1:3001"
+
+  [projects.users]
+    default_role = "member"
+
+      [projects.users.roles.admin]
+        user_ids = ["839107207"]
+
+        [projects.users.roles.admin.rate_limit]
+          max_messages = 60
+          window_secs = 60
+
+      [projects.users.roles.member]
+        user_ids = ["*"]
+        disabled_commands = ["*"]
+
+        [projects.users.roles.member.rate_limit]
+          max_messages = 10
+          window_secs = 60
+
+[[projects]]
+  name = "whale-qq-8826812"
+  reset_on_idle_mins = 0
+  show_context_indicator = false
+  show_workdir_indicator = false
+  reply_footer = false
+  inject_sender = true
+  admin_from = "839107207"
+
+  [projects.agent]
+    type = "acp"
+
+    [projects.agent.options]
+      args = ["acp", "--sandbox", "--dangerously-skip-permissions", "--log-file", "/dev/null"]
+      cmd = "/usr/local/bin/agy"
+      display_name = "Whale ACP (8826812)"
+      model = "gemini-4-hydrogen"
+      work_dir = "/opt/cc-connect/whale-workspace-8826812"
+
+    [projects.agent.options.env]
+      HTTPS_PROXY = "http://127.0.0.1:7897"
+      HTTP_PROXY = "http://127.0.0.1:7897"
+      NO_PROXY = "localhost,127.0.0.1,::1"
+
+  [[projects.platforms]]
+    type = "qq"
+
+    [projects.platforms.options]
+      allow_from = "8826812"
+      allow_groups = "__none__"
+      allow_private = "8826812"
+      error_user_id = "839107207"
+      http_token = "<REPLACE_WITH_ONEBOT_HTTP_TOKEN>"
+      http_url = "http://127.0.0.1:3000"
+      require_mention = false
+      share_session_in_channel = false
+      split_lines = true
+      token = "<REPLACE_WITH_ONEBOT_WS_TOKEN>"
+      ws_url = "ws://127.0.0.1:3001"
+
+  [projects.users]
+    default_role = "member"
+
+      [projects.users.roles.admin]
+        user_ids = ["839107207"]
+
+        [projects.users.roles.admin.rate_limit]
+          max_messages = 60
+          window_secs = 60
+
+      [projects.users.roles.member]
+        user_ids = ["*"]
+        disabled_commands = ["*"]
+
+        [projects.users.roles.member.rate_limit]
+          max_messages = 10
+          window_secs = 60
+
+[log]
+  level = "warn"
+
+[speech]
+  enabled = false
+  provider = ""
+  language = ""
+
+  [speech.openai]
+    api_key = ""
+    base_url = ""
+    model = ""
+
+  [speech.groq]
+    api_key = ""
+    model = ""
+
+  [speech.qwen]
+    api_key = ""
+    base_url = ""
+    model = ""
+
+  [speech.gemini]
+    api_key = ""
+    model = ""
+
+[tts]
+  enabled = false
+  provider = ""
+  voice = ""
+  voice_id = ""
+  speed = 0.0
+  language_type = ""
+  tts_mode = ""
+  max_text_len = 0
+
+  [tts.openai]
+    api_key = ""
+    base_url = ""
+    model = ""
+
+  [tts.qwen]
+    api_key = ""
+    base_url = ""
+    model = ""
+
+  [tts.minimax]
+    api_key = ""
+    base_url = ""
+    model = ""
+    config_file = ""
+
+  [tts.mimo]
+    api_key = ""
+    base_url = ""
+    model = ""
+
+[display]
+  mode = "quiet"
+  thinking_messages = false
+  tool_messages = false
+  show_context_indicator = false
+  reply_footer = false
+  hide_agent_footer = true
+
+[stream_preview]
+  enabled = false
+
+[instant_reply]
+  content = ""
+
+[outgoing_rate_limit]
+  max_per_second = 1.5
+  burst = 3
+
+[cron]
+  session_mode = ""
+
+[webhook]
+  port = 0
+
+[bridge]
+  enabled = true
+  port = 9810
+  token = "<REPLACE_WITH_BRIDGE_TOKEN>"
+  cors_origins = ["*"]
+
+[management]
+  enabled = true
+  port = 9820
+  token = "<REPLACE_WITH_MANAGEMENT_TOKEN>"
+  cors_origins = ["*"]
